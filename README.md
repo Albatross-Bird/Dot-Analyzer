@@ -1,11 +1,11 @@
-# Dot Analyzer v8.0 — ImGui + OpenGL3 Edition
+# Dot Analyzer v8.1.6 — ImGui + OpenGL3 Edition
 
 Analyzes PGM images of dispensed fluid dots on a substrate. Measures diameter, circularity, XY grid offset, and flags missed/merged dots across batches of images. Includes live GVSP packet capture from Basler cameras via Npcap.
 
 ## Quick Start
 
 1. Download ImGui from https://github.com/ocornut/imgui
-2. Place `imgui/` folder next to `dot_analyzer_v8.cpp`
+2. Place `imgui/` folder next to `dot_analyzer_v8.1.6.cpp`
 3. Run `build.bat`
 
 ## Dependencies
@@ -17,7 +17,7 @@ Analyzes PGM images of dispensed fluid dots on a substrate. Measures diameter, c
 ## Build
 
 ```bat
-g++ dot_analyzer_v8.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_win32.cpp imgui/backends/imgui_impl_opengl3.cpp -o "Dot Analyzer.exe" -I./imgui -I./imgui/backends -lgdi32 -lopengl32 -ldwmapi -lcomdlg32 -lcomctl32 -lole32 -lshell32 -lshlwapi -lws2_32 -mwindows -O2 -DUNICODE -D_UNICODE
+g++ dot_analyzer_v8.1.6.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/backends/imgui_impl_win32.cpp imgui/backends/imgui_impl_opengl3.cpp -o "Dot Analyzer.exe" -I./imgui -I./imgui/backends -lgdi32 -lopengl32 -ldwmapi -lcomdlg32 -lcomctl32 -lole32 -lshell32 -lshlwapi -lws2_32 -mwindows -O2 -DUNICODE -D_UNICODE
 ```
 
 ## Architecture

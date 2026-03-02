@@ -33,7 +33,7 @@ if exist dot_analyzer.rc (
 )
 
 echo [2/3] Compiling source code...
-g++ dot_analyzer_v8.cpp %RES_OBJ% ^
+g++ dot_analyzer_v8.1.6.cpp %RES_OBJ% ^
     imgui\imgui.cpp ^
     imgui\imgui_draw.cpp ^
     imgui\imgui_tables.cpp ^
