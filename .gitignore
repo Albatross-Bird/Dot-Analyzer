@@ -1,0 +1,14 @@
+# Third-party dependencies (clone from https://github.com/ocornut/imgui)
+imgui/
+
+# Build artifacts
+*.exe
+*.o
+*.obj
+
+# User config (machine-specific)
+dot_analyzer.cfg
+
+# Windows
+Thumbs.db
+Desktop.ini
