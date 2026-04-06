@@ -1,5 +1,5 @@
 /*
- * Dot Analyzer v8.0 — ImGui + OpenGL3 Edition
+ * Dot Analyzer v8.2.5 — ImGui + OpenGL3 Edition
  *
  * Analyzes PGM images of dispensed fluid dots on a substrate.
  * Two measurement modes: Bounding Box and Body Detection (morphological).
@@ -56,6 +56,7 @@
 
 /* ===== IMGUI ===== */
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl3.h"
 
@@ -160,6 +161,9 @@ static int load_npcap(void) {
 
 #define MODE_BBOX   0
 #define MODE_BODY   1
+#define THRESH_MANUAL   0
+#define THRESH_OTSU     1
+#define THRESH_ADAPTIVE 2
 
 #define GRIDPAT_RECT      0
 #define GRIDPAT_STAGGERED 1
@@ -205,12 +209,23 @@ static char   g_folder_a[MAX_PATH_LEN] = "";
 static wchar_t g_folder_w[MAX_PATH_LEN] = L"";
 static char   g_pxmm_buf[64]   = "10.0";
 static int    g_mode            = MODE_BBOX;
-static int    g_auto_thresh     = 1;
+static int    g_thresh_mode     = THRESH_OTSU;
 static int    g_threshold       = 100;
+static int    g_adapt_block     = 120;
+static int    g_adapt_sens      = 15;
 static int    g_min_area        = 150;
 static int    g_erosion         = 4;
+static int    g_scratch_filter  = 3;
+static int    g_min_dimension   = 0;
 static int    g_show_cross      = 0;
 static int    g_show_grid       = 0;
+/* Shape filters */
+static int    g_filter_circ     = 0;
+static double g_min_circ        = 0.40;
+static int    g_filter_solidity = 0;
+static double g_min_solidity    = 0.50;
+static int    g_filter_aspect   = 0;
+static double g_max_aspect      = 2.0;
 static int    g_grid_pattern    = GRIDPAT_RECT;
 static int    g_min_pos_columns = 4;   /* min qualified columns to evaluate position */
 static int    g_min_col_dots    = 3;   /* min dots in a column to count it as qualified */
@@ -296,6 +311,12 @@ static float    g_mad_peak = 0.0f;       /* running max for auto-scale */
 
 /* Stitch mode */
 static int   g_stitch_mode = 0;
+
+/* Output selection flags (all on by default) */
+static int g_out_annotated  = 1;
+static int g_out_csv        = 1;
+static int g_out_dist_plot  = 1;
+static int g_out_trend_plot = 1;
 static char  g_stitch_overlap_buf[16] = "20";  /* percent */
 static char  g_stitch_scale_buf[16] = "100";   /* percent, 100 = native */
 #define MAX_STITCH_TILES 1024
@@ -366,7 +387,105 @@ typedef struct {
     /* Info bar */
     const char *grid_info_fmt;    /* "grid: %.1fx%.1f px, %.2f°  (%d cols)" */
     const char *pos_skipped_fmt;  /* "position: skipped (%d/%d cols)" */
+    /* Record mode — orientation / live / stitch */
+    const char *orientation;
+    const char *flip_x;
+    const char *flip_y;
+    const char *rotate_90;
+    const char *live_preview;
+    const char *stop_preview;
+    const char *stitch_mode;
+    const char *overlap_pct;
+    const char *scale_pct;
+    const char *grid_auto_hint;
+    /* Preview status badges */
+    const char *stitched_result;
+    const char *live_feed;
+    const char *mad_fmt;
+    /* Top-level group headers */
+    const char *sec_analyze;
+    /* Detection improvements */
+    const char *thresh_mode_label;
+    const char *thresh_manual;
+    const char *thresh_otsu;
+    const char *thresh_adaptive;
+    const char *adapt_block_label;
+    const char *adapt_sens_label;
+    const char *scratch_filter_label;
+    const char *min_dim_label;
+    /* Tooltips */
+    const char *tip_pixels_mm;
+    const char *tip_measurement;
+    const char *tip_thresh_mode;
+    const char *tip_thresh_manual;
+    const char *tip_adapt_block;
+    const char *tip_adapt_sens;
+    const char *tip_min_area;
+    const char *tip_min_dim;
+    const char *tip_erosion;
+    const char *tip_scratch_filter;
+    const char *tip_circ_enable;
+    const char *tip_min_circ;
+    const char *tip_solid_enable;
+    const char *tip_min_solid;
+    const char *tip_aspect_enable;
+    const char *tip_max_aspect;
+    const char *tip_crosshairs;
+    const char *tip_grid_lines;
+    const char *tip_grid_pattern;
+    const char *tip_min_columns;
+    const char *tip_min_dots_col;
+    const char *tip_stable_s;
+    const char *tip_mad;
+    const char *tip_orientation;
+    const char *tip_stitch_mode;
+    const char *tip_overlap_pct;
+    const char *tip_scale_pct;
+    /* Shape filters */
+    const char *sec_shape_filters;
+    const char *filter_circ_enable;
+    const char *filter_circ_label;
+    const char *filter_solidity_enable;
+    const char *filter_solidity_label;
+    const char *filter_aspect_enable;
+    const char *filter_aspect_label;
+    /* Outputs */
+    const char *sec_outputs;
+    const char *out_annotated;
+    const char *out_csv;
+    const char *out_dist_plot;
+    const char *out_trend_plot;
 } lang_strings_t;
+
+/* Tooltip strings — English (reused for all languages; purely technical content) */
+#define TIPS_ALL \
+    "Camera calibration: pixels per 1 mm on the substrate.\nUsed for all diameter and offset calculations.\nMeasure by imaging a ruler or calibration target.", \
+    "How dot diameter is measured:\n\nBounding Box: largest side of the blob's bounding rectangle. Fast, but includes splash/spread.\n\nBody Detection: morphological erosion isolates the dense core, then measures its major axis. More accurate for dots with tails or irregular splash.", \
+    "How the image is converted to black-and-white:\n\nManual: fixed brightness cutoff.\nAuto (Otsu): best global cutoff from the image histogram. Works well with even lighting.\nAdaptive: compares each pixel to its local neighborhood average. Handles uneven lighting, shadows, and vignetting.", \
+    "Pixels darker than this value are treated as foreground.\nRange: 1-254. Lower = only very dark features.\nHigher = more sensitive but may pick up background noise.", \
+    "Radius (px) of the local neighborhood for adaptive threshold.\nShould be 2-3x larger than your dot diameter.\nLarger adapts to broad lighting gradients; smaller responds to local contrast.\nTypical range: 80-200.", \
+    "How much darker than the local average a pixel must be to count as foreground.\nHigher = fewer false detections. Lower = catches fainter dots but may pick up noise.\nTypical: 8-20. Start at 15 and adjust.", \
+    "Minimum blob area in pixels. Smaller blobs are discarded.\nFilters noise, dust specks, and tiny artifacts.\nSet just below the area of your smallest real dot.\nCheck 'smallest=N px' in the info bar to calibrate.", \
+    "Minimum bounding box width or height.\nBlobs narrower than this value are discarded.\nEffective at filtering thin scratch fragments that pass the area filter.\n0 = disabled. 10-15 works well for most dot sizes.", \
+    "Morphological erosion radius used in Body Detection mode.\nErodes the outer splash/spread to isolate the dense dot core for measurement.\nToo large: small dots may erode away. Too small: splash tails remain.\nTypical: 3-8.", \
+    "Morphological opening applied to the binary image BEFORE blob detection.\nRemoves structures thinner than this radius (scratches, fine marks, debris lines) while leaving dots intact.\n0 = disabled. 2-4 cleans most substrate scratches without affecting dots.", \
+    "Filters blobs by circularity (4*pi*Area / Perimeter^2).\nPerfect circle = 1.0. Scratches and debris typically score 0.05-0.30.\nReal dots typically score 0.50-0.95.", \
+    "Blobs below this circularity value are rejected.\nTypical: 0.35-0.50. Lower = more permissive; higher = stricter.", \
+    "Filters blobs by solidity (area / bounding box area).\nA solid filled shape scores near 1.0. Jagged, fragmented, or concave shapes score lower.\nUseful for rejecting partially-detected or broken artifacts.", \
+    "Blobs below this solidity value are rejected.\nTypical: 0.50-0.70.", \
+    "Filters blobs by aspect ratio (max side / min side).\nA circle = 1.0. Elongated scratches or merged dot pairs have higher values.\nAdds a hard reject on top of the built-in 1.85 merge detector.", \
+    "Blobs above this aspect ratio are rejected.\nTypical: 1.5-2.0. Lower = stricter.\nNote: the built-in merge detector already flags blobs above 1.85.", \
+    "Draw crosshair markers at each detected dot's centroid.\nColor indicates grid offset: green = well-aligned, red = large offset from expected position.\nRequires grid inference (enabled automatically when grid lines are on).", \
+    "Draw the inferred grid over the preview image.\nBlue dashed lines show detected row/column pattern.\nRed circle-X markers indicate missed dot positions (grid nodes with no detected dot).", \
+    "Expected dot grid layout:\n\nRectangular: regular rows and columns with consistent X and Y spacing.\n\nChecker/Staggered: alternating rows or columns offset by half the spacing, like a hex or brick pattern.", \
+    "Minimum number of qualified columns required for grid inference to succeed.\nIf fewer aligned columns are found, grid overlay is skipped.\nIncrease to reduce false inference; decrease for images with few columns.", \
+    "Minimum dots a column must contain to be counted as 'qualified' for grid inference.\nColumns with fewer dots are ignored.\nPrevents stray dots from being treated as valid grid columns.", \
+    "Seconds the image must remain stable before a frame is saved.\nPrevents saving during camera movement or stage transitions.\nTypical: 0.15-0.50.", \
+    "Frame-to-frame change threshold (Mean Absolute Difference).\nAverage per-pixel difference below this = stable frame.\nLower = requires more stillness. Higher = tolerates minor vibration.\nTypical: 5-20.", \
+    "Transform captured frames before saving.\nCorrects for camera mounting orientation or mirror effects.\nTransformations are applied in order: flip, then rotate.", \
+    "When enabled, captures a grid of images as the stage moves and stitches them into one composite.\nThe grid layout is auto-detected from capture timing.", \
+    "Percentage overlap between adjacent stitch tiles.\nThe stitcher uses this to determine how much each tile overlaps its neighbor.\nTypical: 10-30%.", \
+    "Output scale for the stitched composite image.\n100% = native resolution. Lower values reduce file size for large stitch grids."
 
 static const lang_strings_t lang_en = {
     "IMAGE FOLDER", "CALIBRATION", "THRESHOLD", "OVERLAYS", "RECORD MODE",
@@ -380,7 +499,22 @@ static const lang_strings_t lang_en = {
     "Output:", "Scan", "Stable (s)", "MAD", "Start Recording", "Stop Recording", "(no interfaces)",
     "Zoom", "Reset", "No preview. Select a folder with PGM files.",
     "grid: %.1fx%.1f px, %.2f\xC2\xB0  (%d cols)",
-    "position: skipped (%d/%d cols)"
+    "position: skipped (%d/%d cols)",
+    "Orientation:", "Flip X", "Flip Y", "Rotate 90",
+    "Live Preview", "Stop Preview",
+    "Stitch mode", "Overlap %", "Scale %", "Grid auto-detected from capture timing",
+    "STITCHED RESULT", "LIVE FEED", "MAD: %.1f",
+    "ANALYZE",
+    "Threshold mode:", "Manual", "Auto (Otsu)", "Adaptive",
+    "Block radius (px):", "Sensitivity:",
+    "Scratch filter (px):", "Min dimension (px):",
+    TIPS_ALL,
+    "SHAPE FILTERS",
+    "Enable circularity filter", "Min circularity:",
+    "Enable solidity filter", "Min solidity:",
+    "Enable aspect ratio filter", "Max aspect ratio:",
+    "OUTPUTS",
+    "Annotated Images", "CSV Data", "Distribution Plot", "Trend Plot"
 };
 
 static const lang_strings_t lang_zh = {
@@ -420,7 +554,38 @@ static const lang_strings_t lang_zh = {
     "\xe9\x87\x8d\xe7\xbd\xae",                                                        /* 重置 */
     "\xe6\x97\xa0\xe9\xa2\x84\xe8\xa7\x88\xe3\x80\x82\xe8\xaf\xb7\xe9\x80\x89\xe6\x8b\xa9\xe5\x8c\x85\xe5\x90\xab PGM \xe6\x96\x87\xe4\xbb\xb6\xe7\x9a\x84\xe6\x96\x87\xe4\xbb\xb6\xe5\xa4\xb9\xe3\x80\x82", /* 无预览。请选择包含PGM文件的文件夹。 */
     "grid: %.1fx%.1f px, %.2f\xC2\xB0  (%d cols)",
-    "position: skipped (%d/%d cols)"
+    "position: skipped (%d/%d cols)",
+    "\xe6\x96\xb9\xe5\x90\x91:",                                                       /* 方向: */
+    "\xe6\xb0\xb4\xe5\xb9\xb3\xe7\xbf\xbb\xe8\xbd\xac",                               /* 水平翻转 */
+    "\xe5\x9e\x82\xe7\x9b\xb4\xe7\xbf\xbb\xe8\xbd\xac",                               /* 垂直翻转 */
+    "\xe6\x97\x8b\xe8\xbd\xac 90",                                                     /* 旋转 90 */
+    "\xe5\xae\x9e\xe6\x97\xb6\xe9\xa2\x84\xe8\xa7\x88",                               /* 实时预览 */
+    "\xe5\x81\x9c\xe6\xad\xa2\xe9\xa2\x84\xe8\xa7\x88",                               /* 停止预览 */
+    "\xe6\x8b\xbc\xe6\x8e\xa5\xe6\xa8\xa1\xe5\xbc\x8f",                               /* 拼接模式 */
+    "\xe9\x87\x8d\xe5\x8f\xa0 %",                                                      /* 重叠 % */
+    "\xe7\xbc\xa9\xe6\x94\xbe %",                                                      /* 缩放 % */
+    "\xe7\xbd\x91\xe6\xa0\xbc\xe7\x94\xb1\xe9\x87\x87\xe9\x9b\x86\xe6\x97\xb6\xe5\xba\x8f\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b", /* 网格由采集时序自动检测 */
+    "\xe6\x8b\xbc\xe6\x8e\xa5\xe7\xbb\x93\xe6\x9e\x9c",                               /* 拼接结果 */
+    "\xe5\xae\x9e\xe6\x97\xb6\xe7\x94\xbb\xe9\x9d\xa2",                               /* 实时画面 */
+    "MAD: %.1f",
+    "\xe5\x88\x86\xe6\x9e\x90",                                                        /* 分析 */
+    "\xe9\x98\x88\xe5\x80\xbc\xe6\xa8\xa1\xe5\xbc\x8f:",                               /* 阈值模式: */
+    "\xe6\x89\x8b\xe5\x8a\xa8",                                                        /* 手动 */
+    "\xe8\x87\xaa\xe5\x8a\xa8 (Otsu)",                                                 /* 自动 (Otsu) */
+    "\xe8\x87\xaa\xe9\x80\x82\xe5\xba\x94",                                            /* 自适应 */
+    "\xe5\x9d\x97\xe5\x8d\x8a\xe5\xbe\x84 (\xe5\x83\x8f\xe7\xb4\xa0):",               /* 块半径 (像素): */
+    "\xe7\x81\xb5\xe6\x95\x8f\xe5\xba\xa6:",                                           /* 灵敏度: */
+    "\xe5\x88\x92\xe7\x97\x95\xe8\xbf\x87\xe6\xbb\xa4 (\xe5\x83\x8f\xe7\xb4\xa0):",   /* 划痕过滤 (像素): */
+    "\xe6\x9c\x80\xe5\xb0\x8f\xe5\xb0\xba\xe5\xaf\xb8 (\xe5\x83\x8f\xe7\xb4\xa0):",   /* 最小尺寸 (像素): */
+    TIPS_ALL,
+    "\xe5\xbd\xa2\xe7\x8a\xb6\xe8\xbf\x87\xe6\xbb\xa4",
+    "\xe5\x90\xaf\xe7\x94\xa8\xe5\x9c\x86\xe5\xba\xa6\xe8\xbf\x87\xe6\xbb\xa4",
+    "\xe6\x9c\x80\xe5\xb0\x8f\xe5\x9c\x86\xe5\xba\xa6:",
+    "\xe5\x90\xaf\xe7\x94\xa8\xe5\xaf\x86\xe5\xae\x9e\xe5\xba\xa6\xe8\xbf\x87\xe6\xbb\xa4",
+    "\xe6\x9c\x80\xe5\xb0\x8f\xe5\xaf\x86\xe5\xae\x9e\xe5\xba\xa6:",
+    "\xe5\x90\xaf\xe7\x94\xa8\xe5\xae\xbd\xe9\xab\x98\xe6\xaf\x94\xe8\xbf\x87\xe6\xbb\xa4",
+    "\xe6\x9c\x80\xe5\xa4\xa7\xe5\xae\xbd\xe9\xab\x98\xe6\xaf\x94:",
+    "\xe8\xbe\x93\xe5\x87\xba", "Annotated Images", "CSV Data", "Distribution Plot", "Trend Plot"
 };
 
 static const lang_strings_t lang_es = {
@@ -437,7 +602,21 @@ static const lang_strings_t lang_es = {
     "(sin interfaces)",
     "Zoom", "Restablecer", "Sin vista previa. Seleccione una carpeta con archivos PGM.",
     "grid: %.1fx%.1f px, %.2f\xC2\xB0  (%d cols)",
-    "position: skipped (%d/%d cols)"
+    "position: skipped (%d/%d cols)",
+    "Orientaci\xc3\xb3n:", "Voltear X", "Voltear Y", "Rotar 90",
+    "Vista en vivo", "Detener vista",
+    "Modo uni\xc3\xb3n", "Superpos. %", "Escala %", "Cuadr\xc3\xad" "cula auto-detectada por tiempo",
+    "RESULTADO UNIDO", "EN VIVO", "MAD: %.1f",
+    "ANALIZAR",
+    "Modo de umbral:", "Manual", "Auto (Otsu)", "Adaptativo",
+    "Radio de bloque (px):", "Sensibilidad:",
+    "Filtro de ara\xc3\xb1" "azos (px):", "Dimensi\xc3\xb3n m\xc3\xadnima (px):",
+    TIPS_ALL,
+    "FILTROS DE FORMA",
+    "Habilitar filtro de circularidad", "Circularidad m\xc3\xadnima:",
+    "Habilitar filtro de solidez", "Solidez m\xc3\xadnima:",
+    "Habilitar filtro de relaci\xc3\xb3n de aspecto", "Relaci\xc3\xb3n de aspecto m\xc3\xa1xima:",
+    "SALIDAS", "Im\xc3\xa1" "genes anotadas", "Datos CSV", "Gr\xc3\xa1" "fico de distribuci\xc3\xb3n", "Gr\xc3\xa1" "fico de tendencia"
 };
 
 static const lang_strings_t lang_nl = {
@@ -453,7 +632,21 @@ static const lang_strings_t lang_nl = {
     "(geen interfaces)",
     "Zoom", "Herstellen", "Geen voorbeeld. Selecteer een map met PGM-bestanden.",
     "grid: %.1fx%.1f px, %.2f\xC2\xB0  (%d cols)",
-    "position: skipped (%d/%d cols)"
+    "position: skipped (%d/%d cols)",
+    "Ori\xc3\xabntatie:", "Spiegelen X", "Spiegelen Y", "Draaien 90",
+    "Live voorbeeld", "Stop voorbeeld",
+    "Samenvoegen", "Overlap %", "Schaal %", "Raster auto-gedetecteerd van timing",
+    "SAMENGEVOEGD", "LIVE BEELD", "MAD: %.1f",
+    "ANALYSEREN",
+    "Drempelwaarde modus:", "Handmatig", "Auto (Otsu)", "Adaptief",
+    "Blokstraal (px):", "Gevoeligheid:",
+    "Krasfilter (px):", "Min afmeting (px):",
+    TIPS_ALL,
+    "VORMFILTERS",
+    "Circulariteitsfilter inschakelen", "Min circulariteit:",
+    "Soliditeitsfilter inschakelen", "Min soliditeit:",
+    "Beeldverhoudingsfilter inschakelen", "Max beeldverhouding:",
+    "UITVOER", "Geannoteerde afbeeldingen", "CSV-gegevens", "Distributiegrafiek", "Trendgrafiek"
 };
 
 static const lang_strings_t *g_langs[NUM_LANGS] = { &lang_en, &lang_zh, &lang_es, &lang_nl };
@@ -1241,6 +1434,31 @@ static int compute_otsu(const uint8_t *px, int count) {
     return th;
 }
 
+/* Adaptive threshold using integral-image box blur (O(1) per pixel) */
+static void threshold_adaptive(const uint8_t *pixels, int w, int h,
+    uint8_t *bin, int block_r, int sensitivity) {
+    int64_t *ii = (int64_t*)calloc((w+1)*(h+1), sizeof(int64_t));
+    if (!ii) { memset(bin, 0, w*h); return; }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            ii[(y+1)*(w+1)+(x+1)] = pixels[y*w+x]
+                + ii[y*(w+1)+(x+1)] + ii[(y+1)*(w+1)+x] - ii[y*(w+1)+x];
+    for (int y = 0; y < h; y++) {
+        int y0 = y-block_r < 0 ? 0 : y-block_r;
+        int y1 = y+block_r >= h ? h-1 : y+block_r;
+        for (int x = 0; x < w; x++) {
+            int x0 = x-block_r < 0 ? 0 : x-block_r;
+            int x1 = x+block_r >= w ? w-1 : x+block_r;
+            int64_t sum = ii[(y1+1)*(w+1)+(x1+1)] - ii[y0*(w+1)+(x1+1)]
+                        - ii[(y1+1)*(w+1)+x0]     + ii[y0*(w+1)+x0];
+            int count = (x1-x0+1)*(y1-y0+1);
+            double local_mean = (double)sum / count;
+            bin[y*w+x] = (pixels[y*w+x] < local_mean - sensitivity) ? 1 : 0;
+        }
+    }
+    free(ii);
+}
+
 static void fill_holes(uint8_t *bin, int w, int h) {
     uint8_t *vis=(uint8_t*)calloc(w*h,1);int *Q=(int*)malloc(w*h*sizeof(int));
     if(!vis||!Q){free(vis);free(Q);return;}
@@ -1281,7 +1499,7 @@ static uint8_t *morph_open(const uint8_t *bin,int w,int h,int r){
 }
 
 static int find_blobs_labeled(const uint8_t *bin,int w,int h,
-    blob_t *blobs,int mx_blobs,int min_area,int **out_labels){
+    blob_t *blobs,int mx_blobs,int min_area,int min_dim,int **out_labels){
     int *labels=(int*)calloc(w*h,sizeof(int));
     int *Q=(int*)malloc(w*h*sizeof(int));
     if(!labels||!Q){free(labels);free(Q);*out_labels=NULL;return 0;}
@@ -1295,12 +1513,14 @@ static int find_blobs_labeled(const uint8_t *bin,int w,int h,
             if(cx2<bx0)bx0=cx2;if(cx2>bx1)bx1=cx2;if(cy2<by0)by0=cy2;if(cy2>by1)by1=cy2;
             int nb[4]={(cy2>0)?ci-w:-1,(cy2<h-1)?ci+w:-1,(cx2>0)?ci-1:-1,(cx2<w-1)?ci+1:-1};
             for(int j=0;j<4;j++){int n=nb[j];if(n>=0&&bin[n]&&!labels[n]){labels[n]=lbl;Q[qt++]=n;}}}
-        if(area>=min_area&&bx0>0&&by0>0&&bx1<w-1&&by1<h-1){
+        { int ms=(bx1-bx0+1<by1-by0+1)?bx1-bx0+1:by1-by0+1;
+        if(area>=min_area&&(min_dim<=0||ms>=min_dim)&&bx0>0&&by0>0&&bx1<w-1&&by1<h-1){
             blob_t *b=&blobs[nb_out];memset(b,0,sizeof(blob_t));
             b->label=lbl;b->area=area;b->min_x=bx0;b->min_y=by0;b->max_x=bx1;b->max_y=by1;
             b->bb_w=bx1-bx0+1;b->bb_h=by1-by0+1;
             b->diameter_px=(b->bb_w>b->bb_h)?b->bb_w:b->bb_h;
             b->cx=(int)(sx/area);b->cy=(int)(sy/area);nb_out++;}}
+    }
     free(Q);*out_labels=labels;return nb_out;
 }
 
@@ -1372,7 +1592,10 @@ static void compute_measurements(const int *labels,const uint8_t *opened,
     free(acc);free(l2i);
 }
 
-static void flag_merged(blob_t *blobs,int n){
+static void flag_merged(blob_t *blobs, int n,
+                        int filt_circ, double min_circ,
+                        int filt_solid, double min_solid,
+                        int filt_asp, double max_asp) {
     if(n<3)return;
     int *a=(int*)malloc(n*sizeof(int));if(!a)return;
     for(int i=0;i<n;i++)a[i]=blobs[i].area;
@@ -1380,32 +1603,66 @@ static void flag_merged(blob_t *blobs,int n){
     int med=a[n/2];free(a);
     for(int i=0;i<n;i++){double asp=(double)blobs[i].bb_w/(double)blobs[i].bb_h;
         if(asp<1.0)asp=1.0/asp;if(asp>MERGE_RATIO||blobs[i].area>med*2.2)blobs[i].merged=1;}
+    /* Shape filters */
+    for (int i = 0; i < n; i++) {
+        if (blobs[i].merged) continue;
+        if (filt_circ && blobs[i].circularity_raw > 0.001 && blobs[i].circularity_raw < min_circ)
+            blobs[i].merged = 1;
+        if (filt_solid) {
+            double bbox_area = (double)blobs[i].bb_w * (double)blobs[i].bb_h;
+            if (bbox_area > 0 && (double)blobs[i].area / bbox_area < min_solid)
+                blobs[i].merged = 1;
+        }
+        if (filt_asp) {
+            double asp = (double)blobs[i].bb_w / (double)blobs[i].bb_h;
+            if (asp < 1.0) asp = 1.0 / asp;
+            if (asp > max_asp) blobs[i].merged = 1;
+        }
+    }
 }
 
-static int process_image_full(const pgm_image_t *img,int thresh,int min_area,
-    int erosion_r,blob_t *blobs,int mx){
+static int process_image_full(const pgm_image_t *img, int thresh_mode,
+    int thresh_val, int adapt_block, int adapt_sens,
+    int scratch_r, int min_area, int erosion_r, int min_dim,
+    blob_t *blobs, int mx) {
     int W=img->width,H=img->height,sz=W*H;
     uint8_t *bin=(uint8_t*)calloc(sz,1);if(!bin)return 0;
-    for(int i=0;i<sz;i++)bin[i]=(img->pixels[i]<thresh)?1:0;
+    if (thresh_mode == THRESH_ADAPTIVE)
+        threshold_adaptive(img->pixels,W,H,bin,adapt_block,adapt_sens);
+    else
+        for(int i=0;i<sz;i++)bin[i]=(img->pixels[i]<thresh_val)?1:0;
     fill_holes(bin,W,H);
+    if (scratch_r > 0) {
+        uint8_t *cleaned=morph_open(bin,W,H,scratch_r);
+        if(cleaned){memcpy(bin,cleaned,sz);free(cleaned);}
+    }
     uint8_t *opened=morph_open(bin,W,H,erosion_r);
     int *labels=NULL;
-    int nb=find_blobs_labeled(bin,W,H,blobs,mx,min_area,&labels);
+    int nb=find_blobs_labeled(bin,W,H,blobs,mx,min_area,min_dim,&labels);
     if(labels){compute_measurements(labels,opened,W,H,blobs,nb);free(labels);}
-    flag_merged(blobs,nb);
+    flag_merged(blobs,nb, g_filter_circ,g_min_circ, g_filter_solidity,g_min_solidity, g_filter_aspect,g_max_aspect);
     free(bin);if(opened)free(opened);
     return nb;
 }
 
-static int process_image_light(const pgm_image_t *img,int thresh,int min_area,
-    blob_t *blobs,int mx){
+static int process_image_light(const pgm_image_t *img, int thresh_mode,
+    int thresh_val, int adapt_block, int adapt_sens,
+    int scratch_r, int min_area, int min_dim,
+    blob_t *blobs, int mx) {
     int W=img->width,H=img->height,sz=W*H;
     uint8_t *bin=(uint8_t*)calloc(sz,1);if(!bin)return 0;
-    for(int i=0;i<sz;i++)bin[i]=(img->pixels[i]<thresh)?1:0;
+    if (thresh_mode == THRESH_ADAPTIVE)
+        threshold_adaptive(img->pixels,W,H,bin,adapt_block,adapt_sens);
+    else
+        for(int i=0;i<sz;i++)bin[i]=(img->pixels[i]<thresh_val)?1:0;
     fill_holes(bin,W,H);
+    if (scratch_r > 0) {
+        uint8_t *cleaned=morph_open(bin,W,H,scratch_r);
+        if(cleaned){memcpy(bin,cleaned,sz);free(cleaned);}
+    }
     int *labels=NULL;
-    int nb=find_blobs_labeled(bin,W,H,blobs,mx,min_area,&labels);
-    flag_merged(blobs,nb);
+    int nb=find_blobs_labeled(bin,W,H,blobs,mx,min_area,min_dim,&labels);
+    flag_merged(blobs,nb, g_filter_circ,g_min_circ, g_filter_solidity,g_min_solidity, g_filter_aspect,g_max_aspect);
     free(bin);if(labels)free(labels);
     return nb;
 }
@@ -1949,9 +2206,10 @@ static void build_preview_rgb(void) {
     if (!g_preview_img.pixels || !g_preview_rgb) return;
     int w = g_preview_img.width, h = g_preview_img.height;
     int thresh = g_threshold;
-    if (g_auto_thresh && g_preview_img.pixels)
+    if (g_thresh_mode == THRESH_OTSU && g_preview_img.pixels) {
         thresh = compute_otsu(g_preview_img.pixels, w * h);
-    g_threshold = thresh; /* keep in sync for display */
+        g_threshold = thresh;
+    }
 
     int min_area = g_min_area, erosion_r = g_erosion, mode = g_mode;
     int need_full = (mode == MODE_BODY || g_show_cross || g_show_grid);
@@ -1964,11 +2222,13 @@ static void build_preview_rgb(void) {
 
     /* Analysis */
     if (need_full)
-        g_preview_nblobs = process_image_full(&g_preview_img, thresh, min_area, erosion_r,
-            g_preview_blobs, MAX_BLOBS);
+        g_preview_nblobs = process_image_full(&g_preview_img, g_thresh_mode, thresh,
+            g_adapt_block, g_adapt_sens, g_scratch_filter, min_area, erosion_r,
+            g_min_dimension, g_preview_blobs, MAX_BLOBS);
     else
-        g_preview_nblobs = process_image_light(&g_preview_img, thresh, min_area,
-            g_preview_blobs, MAX_BLOBS);
+        g_preview_nblobs = process_image_light(&g_preview_img, g_thresh_mode, thresh,
+            g_adapt_block, g_adapt_sens, g_scratch_filter, min_area,
+            g_min_dimension, g_preview_blobs, MAX_BLOBS);
 
     /* Grid inference */
     g_preview_gp.valid = 0;
@@ -2155,15 +2415,22 @@ static void build_preview_rgb(void) {
         }
         snprintf(grid_info, sizeof(grid_info), "  |  %s", gi_body);
     }
+    char thresh_str[32];
+    if (g_thresh_mode == THRESH_ADAPTIVE)
+        snprintf(thresh_str, sizeof(thresh_str), "adap(%d/%d)", g_adapt_block, g_adapt_sens);
+    else if (g_thresh_mode == THRESH_OTSU)
+        snprintf(thresh_str, sizeof(thresh_str), "%d(otsu)", thresh);
+    else
+        snprintf(thresh_str, sizeof(thresh_str), "%d", thresh);
     if (g_preview_missed_dots > 0)
         snprintf(g_preview_info, sizeof(g_preview_info),
-            "thresh=%d  area>=%d  |  %d dots, %d merged, %d missed  |  smallest=%d px%s",
-            thresh, min_area, g_preview_nblobs, mg, g_preview_missed_dots,
+            "thresh=%s  area>=%d  |  %d dots, %d merged, %d missed  |  smallest=%d px%s",
+            thresh_str, min_area, g_preview_nblobs, mg, g_preview_missed_dots,
             g_preview_nblobs > 0 ? g_preview_min_area_detected : 0, grid_info);
     else
         snprintf(g_preview_info, sizeof(g_preview_info),
-            "thresh=%d  area>=%d  |  %d dots, %d merged  |  smallest=%d px%s",
-            thresh, min_area, g_preview_nblobs, mg,
+            "thresh=%s  area>=%d  |  %d dots, %d merged  |  smallest=%d px%s",
+            thresh_str, min_area, g_preview_nblobs, mg,
             g_preview_nblobs > 0 ? g_preview_min_area_detected : 0, grid_info);
 }
 
@@ -2215,7 +2482,11 @@ static void save_config(void) {
     FILE *f = _wfopen(p, L"w"); if (!f) return;
     fprintf(f, "px_per_mm=%s\n", g_pxmm_buf);
     fprintf(f, "threshold=%d\n", g_threshold);
-    fprintf(f, "auto_threshold=%d\n", g_auto_thresh);
+    fprintf(f, "thresh_mode=%d\n", g_thresh_mode);
+    fprintf(f, "adapt_block=%d\n", g_adapt_block);
+    fprintf(f, "adapt_sens=%d\n", g_adapt_sens);
+    fprintf(f, "scratch_filter=%d\n", g_scratch_filter);
+    fprintf(f, "min_dimension=%d\n", g_min_dimension);
     fprintf(f, "min_area=%d\n", g_min_area);
     fprintf(f, "erosion=%d\n", g_erosion);
     fprintf(f, "mode=%d\n", g_mode);
@@ -2231,8 +2502,20 @@ static void save_config(void) {
     fprintf(f, "stitch_mode=%d\n", g_stitch_mode);
     fprintf(f, "stitch_overlap=%s\n", g_stitch_overlap_buf);
     fprintf(f, "stitch_scale=%s\n", g_stitch_scale_buf);
+    fprintf(f, "stable_sec=%s\n", g_stable_sec_buf);
+    fprintf(f, "mad_thresh=%s\n", g_mad_thresh_buf);
+    fprintf(f, "filter_circ=%d\n", g_filter_circ);
+    fprintf(f, "min_circ=%.2f\n", g_min_circ);
+    fprintf(f, "filter_solidity=%d\n", g_filter_solidity);
+    fprintf(f, "min_solidity=%.2f\n", g_min_solidity);
+    fprintf(f, "filter_aspect=%d\n", g_filter_aspect);
+    fprintf(f, "max_aspect=%.1f\n", g_max_aspect);
     fprintf(f, "image_folder=%s\n", g_folder_a);
     fprintf(f, "output_folder=%s\n", g_outfolder_a);
+    fprintf(f, "out_annotated=%d\n", g_out_annotated);
+    fprintf(f, "out_csv=%d\n", g_out_csv);
+    fprintf(f, "out_dist_plot=%d\n", g_out_dist_plot);
+    fprintf(f, "out_trend_plot=%d\n", g_out_trend_plot);
     fclose(f);
 }
 
@@ -2270,7 +2553,18 @@ static void load_config(void) {
         } else if (kl == 9 && strncmp(line, "threshold", 9) == 0) {
             int v = atoi(val); if (v >= 1 && v <= 254) g_threshold = v;
         } else if (kl == 14 && strncmp(line, "auto_threshold", 14) == 0) {
-            g_auto_thresh = atoi(val) ? 1 : 0;
+            /* backward compat: migrate old boolean to thresh_mode */
+            g_thresh_mode = atoi(val) ? THRESH_OTSU : THRESH_MANUAL;
+        } else if (kl == 11 && strncmp(line, "thresh_mode", 11) == 0) {
+            int v = atoi(val); if (v >= 0 && v <= 2) g_thresh_mode = v;
+        } else if (kl == 11 && strncmp(line, "adapt_block", 11) == 0) {
+            int v = atoi(val); if (v >= 10 && v <= 300) g_adapt_block = v;
+        } else if (kl == 10 && strncmp(line, "adapt_sens", 10) == 0) {
+            int v = atoi(val); if (v >= 1 && v <= 50) g_adapt_sens = v;
+        } else if (kl == 14 && strncmp(line, "scratch_filter", 14) == 0) {
+            int v = atoi(val); if (v >= 0 && v <= 10) g_scratch_filter = v;
+        } else if (kl == 13 && strncmp(line, "min_dimension", 13) == 0) {
+            int v = atoi(val); if (v >= 0 && v <= 100) g_min_dimension = v;
         } else if (kl == 8 && strncmp(line, "min_area", 8) == 0) {
             int v = atoi(val); if (v >= 10 && v <= 2000) g_min_area = v;
         } else if (kl == 7 && strncmp(line, "erosion", 7) == 0) {
@@ -2301,10 +2595,34 @@ static void load_config(void) {
             strncpy(g_stitch_overlap_buf, val, sizeof(g_stitch_overlap_buf)-1);
         } else if (kl == 12 && strncmp(line, "stitch_scale", 12) == 0) {
             strncpy(g_stitch_scale_buf, val, sizeof(g_stitch_scale_buf)-1);
+        } else if (kl == 10 && strncmp(line, "stable_sec", 10) == 0) {
+            if (atof(val) > 0.0) strncpy(g_stable_sec_buf, val, sizeof(g_stable_sec_buf)-1);
+        } else if (kl == 10 && strncmp(line, "mad_thresh", 10) == 0) {
+            if (atof(val) > 0.0) strncpy(g_mad_thresh_buf, val, sizeof(g_mad_thresh_buf)-1);
+        } else if (kl == 11 && strncmp(line, "filter_circ", 11) == 0) {
+            g_filter_circ = atoi(val) ? 1 : 0;
+        } else if (kl == 8 && strncmp(line, "min_circ", 8) == 0) {
+            double v = atof(val); if (v >= 0.05 && v <= 0.95) g_min_circ = v;
+        } else if (kl == 15 && strncmp(line, "filter_solidity", 15) == 0) {
+            g_filter_solidity = atoi(val) ? 1 : 0;
+        } else if (kl == 12 && strncmp(line, "min_solidity", 12) == 0) {
+            double v = atof(val); if (v >= 0.10 && v <= 0.95) g_min_solidity = v;
+        } else if (kl == 13 && strncmp(line, "filter_aspect", 13) == 0) {
+            g_filter_aspect = atoi(val) ? 1 : 0;
+        } else if (kl == 10 && strncmp(line, "max_aspect", 10) == 0) {
+            double v = atof(val); if (v >= 1.1 && v <= 5.0) g_max_aspect = v;
         } else if (kl == 12 && strncmp(line, "image_folder", 12) == 0) {
             strncpy(g_folder_a, val, MAX_PATH_LEN - 1); g_folder_a[MAX_PATH_LEN - 1] = 0;
         } else if (kl == 13 && strncmp(line, "output_folder", 13) == 0) {
             strncpy(g_outfolder_a, val, MAX_PATH_LEN - 1); g_outfolder_a[MAX_PATH_LEN - 1] = 0;
+        } else if (kl == 13 && strncmp(line, "out_annotated", 13) == 0) {
+            g_out_annotated  = atoi(val) ? 1 : 0;
+        } else if (kl == 7  && strncmp(line, "out_csv", 7) == 0) {
+            g_out_csv        = atoi(val) ? 1 : 0;
+        } else if (kl == 13 && strncmp(line, "out_dist_plot", 13) == 0) {
+            g_out_dist_plot  = atoi(val) ? 1 : 0;
+        } else if (kl == 14 && strncmp(line, "out_trend_plot", 14) == 0) {
+            g_out_trend_plot = atoi(val) ? 1 : 0;
         }
     }
     fclose(f);
@@ -2421,13 +2739,666 @@ static void stop_recording(void) {
 }
 
 /* ================================================================
+ *  SECTION 14b — PNG DISTRIBUTION PLOT  (no external dependencies)
+ * ================================================================ */
+
+/* --- CRC-32 (ISO 3309) — used for PNG chunks --- */
+static uint32_t g_crc32_tab[256];
+static int      g_crc32_ready = 0;
+static void crc32_init(void) {
+    if (g_crc32_ready) return;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_crc32_tab[i] = c;
+    }
+    g_crc32_ready = 1;
+}
+static uint32_t crc32_calc(const uint8_t *data, size_t len) {
+    crc32_init();
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) c = g_crc32_tab[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* --- Diameter collection for distribution plot --- */
+static double  *g_xdiams = NULL;
+static int      g_xnd    = 0;
+static int      g_xdc    = 0;
+static void xdiam_reset(void) { free(g_xdiams); g_xdiams=NULL; g_xnd=g_xdc=0; }
+static void xdiam_push(double d) {
+    if (g_xnd >= g_xdc) { g_xdc=g_xdc*2+256; g_xdiams=(double*)realloc(g_xdiams,g_xdc*sizeof(double)); }
+    g_xdiams[g_xnd++] = d;
+}
+
+/* Per-image sample means (one entry per processed file) */
+static double  *g_img_means = NULL;
+static int      g_img_n     = 0;
+static int      g_img_cap   = 0;
+static void img_means_reset(void) { free(g_img_means); g_img_means=NULL; g_img_n=g_img_cap=0; }
+static void img_means_push(double m) {
+    if (g_img_n >= g_img_cap) { g_img_cap=g_img_cap*2+16; g_img_means=(double*)realloc(g_img_means,g_img_cap*sizeof(double)); }
+    g_img_means[g_img_n++] = m;
+}
+
+/* --- Plot font (5x7) — covers digits, punctuation, and uppercase letters needed for chart labels ---
+   Glyph index: 0-9=digits, 10='.', 11='-', 12=' ', 13=':', 14='(', 15=')',
+                16='A', 17='C', 18='D', 19='E', 20='I', 21='M',
+                22='N', 23='O', 24='R', 25='S', 26='T', 27='U',
+                28='G', 29='L', 30='P', 31='#',
+                32='+', 33='/', 34='V' */
+static const uint8_t font_plot[][7] = {
+    /* 0 */ {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
+    /* 1 */ {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    /* 2 */ {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+    /* 3 */ {0x0E,0x11,0x01,0x06,0x01,0x11,0x0E},
+    /* 4 */ {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
+    /* 5 */ {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    /* 6 */ {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},
+    /* 7 */ {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+    /* 8 */ {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    /* 9 */ {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
+    /* . */ {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},
+    /* - */ {0x00,0x00,0x00,0x0E,0x00,0x00,0x00},
+    /*   */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    /* : */ {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
+    /* ( */ {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
+    /* ) */ {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+    /* A */ {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
+    /* C */ {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
+    /* D */ {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},
+    /* E */ {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+    /* I */ {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F},
+    /* M */ {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},
+    /* N */ {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
+    /* O */ {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+    /* R */ {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    /* S */ {0x0E,0x11,0x10,0x0E,0x01,0x11,0x0E},
+    /* T */ {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
+    /* U */ {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
+    /* G */ {0x0E,0x11,0x10,0x17,0x11,0x11,0x0E},
+    /* L */ {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
+    /* P */ {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    /* # */ {0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A},
+    /* + */ {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+    /* / */ {0x01,0x02,0x02,0x04,0x08,0x08,0x10},
+    /* V */ {0x11,0x11,0x11,0x0A,0x0A,0x04,0x04},
+};
+#define PFONT_W 5
+#define PFONT_H 7
+#define PFONT_N 35
+static int pfont_idx(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    switch (c) {
+        case '.': return 10; case '-': return 11; case ' ': return 12;
+        case ':': return 13; case '(': return 14; case ')': return 15;
+        case 'A': return 16; case 'C': return 17; case 'D': return 18;
+        case 'E': return 19; case 'I': return 20; case 'M': return 21;
+        case 'N': return 22; case 'O': return 23; case 'R': return 24;
+        case 'S': return 25; case 'T': return 26; case 'U': return 27;
+        case 'G': return 28; case 'L': return 29; case 'P': return 30;
+        case '#': return 31; case '+': return 32; case '/': return 33;
+        case 'V': return 34;
+        default:  return 12;
+    }
+}
+
+/* --- RGB canvas helpers --- */
+#define PLOT_W 800
+#define PLOT_H 480
+static void ppx(uint8_t *rgb, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (x < 0 || x >= PLOT_W || y < 0 || y >= PLOT_H) return;
+    int i = (y * PLOT_W + x) * 3;
+    rgb[i] = r; rgb[i+1] = g; rgb[i+2] = b;
+}
+static void pline_h(uint8_t *rgb, int x0, int x1, int y,
+                    uint8_t r, uint8_t g, uint8_t b) {
+    for (int x = x0; x <= x1; x++) ppx(rgb, x, y, r, g, b);
+}
+static void pline_v(uint8_t *rgb, int x, int y0, int y1,
+                    uint8_t r, uint8_t g, uint8_t b) {
+    for (int y = y0; y <= y1; y++) ppx(rgb, x, y, r, g, b);
+}
+static void prect_fill(uint8_t *rgb, int x0, int y0, int x1, int y1,
+                       uint8_t r, uint8_t g, uint8_t b) {
+    for (int y = y0; y <= y1; y++) pline_h(rgb, x0, x1, y, r, g, b);
+}
+static void pchar(uint8_t *rgb, int ox, int oy, char c,
+                  uint8_t r, uint8_t g, uint8_t b) {
+    int fi = pfont_idx(c);
+    if (fi < 0 || fi >= PFONT_N) return;
+    for (int row = 0; row < PFONT_H; row++) {
+        uint8_t bits = font_plot[fi][row];
+        for (int col = 0; col < PFONT_W; col++)
+            if (bits & (0x10 >> col))
+                ppx(rgb, ox + col, oy + row, r, g, b);
+    }
+}
+static void pstr(uint8_t *rgb, int x, int y, const char *s,
+                 uint8_t r, uint8_t g, uint8_t b) {
+    while (*s) { pchar(rgb, x, y, *s, r, g, b); x += PFONT_W + 1; s++; }
+}
+static int pstr_w(const char *s) {
+    int n = (int)strlen(s);
+    return n > 0 ? n * (PFONT_W + 1) - 1 : 0;
+}
+static void pdraw_line(uint8_t *rgb, int x0, int y0, int x1, int y1,
+                       uint8_t r, uint8_t g, uint8_t b) {
+    int dx = abs(x1-x0), dy = abs(y1-y0);
+    int sx = x0<x1 ? 1:-1, sy = y0<y1 ? 1:-1, err = dx-dy;
+    for (;;) {
+        ppx(rgb, x0, y0, r, g, b);
+        if (x0==x1 && y0==y1) break;
+        int e2 = 2*err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
+}
+static void pdash_h(uint8_t *rgb, int x0, int x1, int y,
+                    uint8_t r, uint8_t g, uint8_t b) {
+    /* 1px thick horizontal dashed line: 10px on, 2px off */
+    int x = x0;
+    while (x <= x1) {
+        for (int i = 0; i < 10 && x+i <= x1; i++) ppx(rgb, x+i, y, r, g, b);
+        x += 12;
+    }
+}
+
+/* --- Adler-32 (zlib checksum) --- */
+static uint32_t adler32_calc(const uint8_t *data, size_t len) {
+    uint32_t s1 = 1, s2 = 0;
+    for (size_t i = 0; i < len; i++) {
+        s1 = (s1 + data[i]) % 65521u;
+        s2 = (s2 + s1)      % 65521u;
+    }
+    return (s2 << 16) | s1;
+}
+
+/* --- PNG chunk writer --- */
+static void png_u32be(FILE *f, uint32_t v) {
+    uint8_t b[4] = {(uint8_t)(v>>24),(uint8_t)(v>>16),(uint8_t)(v>>8),(uint8_t)v};
+    fwrite(b, 1, 4, f);
+}
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t dlen) {
+    crc32_init();
+    png_u32be(f, dlen);
+    fwrite(type, 1, 4, f);
+    if (dlen > 0 && data) fwrite(data, 1, dlen, f);
+    uint32_t c = 0xFFFFFFFFu;
+    for (int i = 0; i < 4; i++) c = g_crc32_tab[(c ^ (uint8_t)type[i]) & 0xFF] ^ (c >> 8);
+    for (uint32_t i = 0; i < dlen; i++) c = g_crc32_tab[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+    png_u32be(f, c ^ 0xFFFFFFFFu);
+}
+
+/* --- Main distribution PNG writer --- */
+static void write_dist_png(const char *folder) {
+    if (g_xnd < 2) return;
+
+    /* --- Statistics --- */
+    double sum = 0.0, sum2 = 0.0;
+    double mn = g_xdiams[0], mx = g_xdiams[0];
+    for (int i = 0; i < g_xnd; i++) {
+        sum  += g_xdiams[i];
+        sum2 += g_xdiams[i] * g_xdiams[i];
+        if (g_xdiams[i] < mn) mn = g_xdiams[i];
+        if (g_xdiams[i] > mx) mx = g_xdiams[i];
+    }
+    double mean = sum / g_xnd;
+    double var  = sum2 / g_xnd - mean * mean;
+    double sd   = (var > 0.0) ? sqrt(var) : 0.0;
+
+    /* Median + percentile bounds: sort a working copy */
+    double *tmp_sort = (double*)malloc(g_xnd * sizeof(double));
+    if (!tmp_sort) return;
+    memcpy(tmp_sort, g_xdiams, g_xnd * sizeof(double));
+    qsort(tmp_sort, g_xnd, sizeof(double), cmp_double);
+    double median = (g_xnd % 2 == 0)
+        ? (tmp_sort[g_xnd/2 - 1] + tmp_sort[g_xnd/2]) * 0.5
+        : tmp_sort[g_xnd/2];
+    /* 0.5th and 99.5th percentile — clips extreme outliers from range calculation */
+    double p_lo = tmp_sort[(int)(g_xnd * 0.005)];
+    double p_hi = tmp_sort[(int)(g_xnd * 0.995) < g_xnd ? (int)(g_xnd * 0.995) : g_xnd - 1];
+
+    /* Detect data quantization step (minimum nonzero gap between adjacent sorted values) */
+    double quant_step = 0.0;
+    {
+        int gap_count = 0;
+        double gap_sum = 0.0;
+        for (int i = 1; i < g_xnd; i++) {
+            double gap = tmp_sort[i] - tmp_sort[i - 1];
+            if (gap > 1e-12) {
+                if (quant_step == 0.0 || gap < quant_step)
+                    quant_step = gap;
+                gap_sum += gap;
+                gap_count++;
+            }
+        }
+        /* Sanity: if quant_step is floating-point noise, fall back to avg gap / 2 */
+        if (gap_count > 0 && quant_step < (gap_sum / gap_count) * 0.1)
+            quant_step = gap_sum / gap_count * 0.5;
+    }
+    free(tmp_sort);
+
+    /* --- Scott's rule bin width, ceiled to a nice value ---
+       Ceiling (vs floor) avoids a comb effect when data is pixel-quantized. */
+    double bw;
+    if (sd < 1e-9 || g_xnd < 3) {
+        bw = (mx - mn > 1e-9) ? (mx - mn) / 15.0 : 0.01;
+    } else {
+        bw = 3.5 * sd / pow((double)g_xnd, 1.0 / 3.0);
+    }
+    static const double nice_bw[] = {
+        0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003, 0.004, 0.005,
+        0.006, 0.008, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05,
+        0.1, 0.2, 0.5, 1.0, 2.0, 5.0
+    };
+    static const int n_nice_bw = sizeof(nice_bw) / sizeof(nice_bw[0]);
+    { double raw = bw; bw = nice_bw[n_nice_bw - 1];
+      for (int i = 0; i < n_nice_bw; i++) { if (nice_bw[i] >= raw) { bw = nice_bw[i]; break; } } }
+
+    /* Floor to data quantization step — prevents sub-quantum empty bins (comb effect) */
+    if (quant_step > 1e-12 && bw < quant_step) {
+        bw = nice_bw[n_nice_bw - 1];
+        for (int i = 0; i < n_nice_bw; i++) {
+            if (nice_bw[i] >= quant_step) { bw = nice_bw[i]; break; }
+        }
+    }
+
+    /* --- Bins symmetric around median; use percentile range so outliers don't
+       explode the axis. Clamp before computing bmin so centering never breaks. */
+    double half_span = (median - p_lo > p_hi - median) ? (median - p_lo) : (p_hi - median);
+    int half_steps   = (int)ceil(half_span / bw) + 1;
+    if (half_steps > 100) half_steps = 100;
+    double bmin = median - half_steps * bw;
+    int nbins   = 2 * half_steps;
+    if (nbins < 5) nbins = 5;
+
+    int *counts = (int*)calloc(nbins, sizeof(int));
+    if (!counts) return;
+    for (int i = 0; i < g_xnd; i++) {
+        int b = (int)((g_xdiams[i] - bmin) / bw);
+        if (b < 0) b = 0;
+        if (b >= nbins) b = nbins - 1;
+        counts[b]++;
+    }
+    int max_count = 0;
+    for (int i = 0; i < nbins; i++) if (counts[i] > max_count) max_count = counts[i];
+    if (max_count == 0) { free(counts); return; }
+
+    /* Y-axis ceiling: tallest bar at 75% of plot height */
+    double y_axis_max = max_count / 0.75;
+
+    /* --- Allocate 800x480 RGB canvas --- */
+    uint8_t *rgb = (uint8_t*)malloc(PLOT_W * PLOT_H * 3);
+    if (!rgb) { free(counts); return; }
+    memset(rgb, 255, PLOT_W * PLOT_H * 3); /* white */
+
+    /* --- Layout margins --- */
+    const int ML = 72, MR = 24, MT = 36, MB = 52;
+    int px0 = ML, px1 = PLOT_W - MR - 1;
+    int py0 = MT, py1 = PLOT_H - MB - 1;
+    int pw = px1 - px0;
+    int ph = py1 - py0;
+
+    /* --- Y-axis nice step (based on y_axis_max) --- */
+    static const int nice_ystep[] = {1,2,5,10,20,50,100,200,500,1000,2000,5000,10000};
+    int y_step = 1;
+    for (int i = 0; i < 13; i++) {
+        y_step = nice_ystep[i];
+        if (y_axis_max / y_step <= 7) break;
+    }
+
+    /* --- Horizontal grid lines (light gray) --- */
+    for (int yv = y_step; (double)yv <= y_axis_max; yv += y_step) {
+        int py = py1 - (int)((double)yv / y_axis_max * ph + 0.5);
+        pline_h(rgb, px0 + 1, px1 - 1, py, 220, 220, 220);
+    }
+
+    /* --- Bars (steel blue, touching — no gaps) --- */
+    double bar_slot = (double)pw / nbins;
+    for (int i = 0; i < nbins; i++) {
+        if (counts[i] == 0) continue;
+        int bx0 = px0 + (int)(i * bar_slot);
+        int bx1 = px0 + (int)((i + 1) * bar_slot);  /* no -1: next bar starts here */
+        if (bx1 <= bx0) bx1 = bx0 + 1;
+        int bar_h = (int)((double)counts[i] / y_axis_max * ph + 0.5);
+        if (bar_h < 1) bar_h = 1;
+        prect_fill(rgb, bx0, py1 - bar_h, bx1 - 1, py1 - 1, 70, 130, 180);
+    }
+
+    /* --- Plot border --- */
+    pline_h(rgb, px0, px1, py0, 80, 80, 80);
+    pline_h(rgb, px0, px1, py1, 80, 80, 80);
+    pline_v(rgb, px0, py0, py1, 80, 80, 80);
+    pline_v(rgb, px1, py0, py1, 80, 80, 80);
+
+    /* --- X-axis ticks: one label per bin, positioned at bar center, value = left edge.
+       The median bin (i == half_steps) is drawn in red; all others in gray. --- */
+    for (int i = 0; i < nbins; i++) {
+        double bin_left = bmin + i * bw;
+        int tx = px0 + (int)(((i + 0.5) / nbins) * pw + 0.5);
+        if (tx <= px0 || tx >= px1) continue;
+        int is_median_bin = (i == half_steps);
+        int tr = is_median_bin ? 200 : 60;
+        int tg = is_median_bin ?  40 : 60;
+        int tb = is_median_bin ?  40 : 60;
+        int tick_len = is_median_bin ? 6 : 4;
+        pline_v(rgb, tx, py1, py1 + tick_len, tr, tg, tb);
+        char lbl[16]; snprintf(lbl, sizeof(lbl), "%.3f", bin_left);
+        int lw = pstr_w(lbl);
+        pstr(rgb, tx - lw / 2, py1 + tick_len + 3, lbl, tr, tg, tb);
+    }
+
+    /* --- Y-axis ticks and labels --- */
+    for (int yv = 0; (double)yv <= y_axis_max; yv += y_step) {
+        int py = py1 - (int)((double)yv / y_axis_max * ph + 0.5);
+        pline_h(rgb, px0 - 4, px0, py, 80, 80, 80);
+        char lbl[16]; snprintf(lbl, sizeof(lbl), "%d", yv);
+        int lw = pstr_w(lbl);
+        pstr(rgb, px0 - 6 - lw, py - PFONT_H / 2, lbl, 60, 60, 60);
+    }
+
+    /* --- Axis labels --- */
+    {
+        const char *xl = "DIAMETER (MM)";
+        int lw = pstr_w(xl);
+        pstr(rgb, (px0 + px1) / 2 - lw / 2, PLOT_H - 14, xl, 40, 40, 40);
+    }
+    {
+        const char *yl = "COUNT";
+        int yn = (int)strlen(yl);
+        int total_h = yn * (PFONT_H + 2) - 2;
+        int ystart = (py0 + py1) / 2 - total_h / 2;
+        for (int i = 0; i < yn; i++) {
+            char ch[2] = {yl[i], 0};
+            pstr(rgb, 4, ystart + i * (PFONT_H + 2), ch, 40, 40, 40);
+        }
+    }
+
+    /* --- Annotations (top-right) --- */
+    {
+        char buf[48];
+        int ax = px1 - 2, ay = py0 + 4;
+
+        snprintf(buf, sizeof(buf), "MEDIAN: %.3f MM", median);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 200, 40, 40);
+        ay += PFONT_H + 4;
+
+        snprintf(buf, sizeof(buf), "MEAN: %.3f MM", mean);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 60, 60, 60);
+        ay += PFONT_H + 4;
+
+        snprintf(buf, sizeof(buf), "SD: %.3f MM", sd);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 60, 60, 60);
+        ay += PFONT_H + 4;
+
+        snprintf(buf, sizeof(buf), "MIN: %.3f MM", mn);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 60, 60, 60);
+        ay += PFONT_H + 4;
+
+        snprintf(buf, sizeof(buf), "MAX: %.3f MM", mx);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 60, 60, 60);
+        ay += PFONT_H + 4;
+
+        snprintf(buf, sizeof(buf), "N: %d", g_xnd);
+        pstr(rgb, ax - pstr_w(buf), ay, buf, 60, 60, 60);
+    }
+
+    /* --- Write PNG file --- */
+    char path[MAX_PATH_LEN];
+    snprintf(path, MAX_PATH_LEN, "%s\\dot_distribution.png", folder);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); free(counts); return; }
+
+    /* PNG signature */
+    static const uint8_t sig[8] = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+    fwrite(sig, 1, 8, f);
+
+    /* IHDR */
+    {
+        uint8_t ihdr[13];
+        ihdr[0]=(PLOT_W>>24)&0xFF; ihdr[1]=(PLOT_W>>16)&0xFF;
+        ihdr[2]=(PLOT_W>> 8)&0xFF; ihdr[3]= PLOT_W     &0xFF;
+        ihdr[4]=(PLOT_H>>24)&0xFF; ihdr[5]=(PLOT_H>>16)&0xFF;
+        ihdr[6]=(PLOT_H>> 8)&0xFF; ihdr[7]= PLOT_H     &0xFF;
+        ihdr[8]=8; ihdr[9]=2; ihdr[10]=0; ihdr[11]=0; ihdr[12]=0;
+        png_chunk(f, "IHDR", ihdr, 13);
+    }
+
+    /* IDAT: zlib header + uncompressed DEFLATE blocks + Adler-32 */
+    {
+        int scan_w = 1 + PLOT_W * 3;          /* filter byte + RGB row */
+        size_t raw_len = (size_t)PLOT_H * scan_w;
+
+        uint8_t *raw = (uint8_t*)malloc(raw_len);
+        if (!raw) { fclose(f); free(rgb); free(counts); return; }
+        for (int y = 0; y < PLOT_H; y++) {
+            raw[y * scan_w] = 0;               /* filter: None */
+            memcpy(raw + y * scan_w + 1, rgb + y * PLOT_W * 3, PLOT_W * 3);
+        }
+
+        uint32_t asum = adler32_calc(raw, raw_len);
+
+        /* Worst-case idat buffer: 2 zlib hdr + ceil(raw/65535)*5 block hdrs + raw + 4 adler */
+        size_t max_bsz  = 65535u;
+        size_t nblocks  = (raw_len + max_bsz - 1) / max_bsz;
+        size_t idat_cap = 2 + nblocks * 5 + raw_len + 4;
+        uint8_t *idat = (uint8_t*)malloc(idat_cap);
+        if (!idat) { free(raw); fclose(f); free(rgb); free(counts); return; }
+
+        size_t pos = 0;
+        idat[pos++] = 0x78; idat[pos++] = 0x01; /* zlib CMF/FLG */
+
+        size_t rem = raw_len, rpos = 0;
+        while (rem > 0) {
+            size_t blen  = rem < max_bsz ? rem : max_bsz;
+            idat[pos++]  = (rem <= max_bsz) ? 0x01 : 0x00; /* BFINAL | BTYPE=00 */
+            uint16_t len16  = (uint16_t)blen;
+            uint16_t nlen16 = ~len16;
+            idat[pos++] = len16  & 0xFF; idat[pos++] = (len16  >> 8) & 0xFF;
+            idat[pos++] = nlen16 & 0xFF; idat[pos++] = (nlen16 >> 8) & 0xFF;
+            memcpy(idat + pos, raw + rpos, blen);
+            pos += blen; rpos += blen; rem -= blen;
+        }
+        idat[pos++] = (asum >> 24) & 0xFF; idat[pos++] = (asum >> 16) & 0xFF;
+        idat[pos++] = (asum >>  8) & 0xFF; idat[pos++] =  asum        & 0xFF;
+
+        png_chunk(f, "IDAT", idat, (uint32_t)pos);
+        free(idat);
+        free(raw);
+    }
+
+    /* IEND */
+    png_chunk(f, "IEND", NULL, 0);
+
+    fclose(f);
+    free(rgb);
+    free(counts);
+}
+
+/* --- Sample-mean trend PNG writer --- */
+static void write_trend_png(const char *folder) {
+    if (g_img_n < 1 || g_xnd < 1) return;
+
+    /* --- Population mean and SD --- */
+    double pop_sum = 0.0, pop_sum2 = 0.0;
+    for (int i = 0; i < g_xnd; i++) { pop_sum += g_xdiams[i]; pop_sum2 += g_xdiams[i]*g_xdiams[i]; }
+    double pop_mean = pop_sum / g_xnd;
+    double pop_sd   = sqrt(pop_sum2 / g_xnd - pop_mean * pop_mean);
+
+    /* --- Y-axis range centred on population mean; ensure ±1 SD is always visible --- */
+    double y_min = g_img_means[0], y_max = g_img_means[0];
+    for (int i = 1; i < g_img_n; i++) {
+        if (g_img_means[i] < y_min) y_min = g_img_means[i];
+        if (g_img_means[i] > y_max) y_max = g_img_means[i];
+    }
+    double half_sd = pop_sd * 0.5;
+    if (pop_mean - half_sd < y_min) y_min = pop_mean - half_sd;
+    if (pop_mean + half_sd > y_max) y_max = pop_mean + half_sd;
+    double half_span = y_max - pop_mean > pop_mean - y_min
+                     ? y_max - pop_mean : pop_mean - y_min;
+    double y_pad = half_span * 0.20 > 1e-6 ? half_span * 0.20 : 1e-4;
+    double y_lo  = pop_mean - half_span - y_pad;
+    double y_hi  = pop_mean + half_span + y_pad;
+
+    /* Nice y step */
+    static const double nice_ys[] = {0.0001,0.0002,0.0005,0.001,0.002,0.005,0.01,0.02,0.05,0.1,0.2,0.5};
+    double y_step = nice_ys[11];
+    for (int i = 0; i < 12; i++) { if ((y_hi-y_lo)/nice_ys[i] <= 7.0) { y_step=nice_ys[i]; break; } }
+    y_lo = floor(y_lo / y_step) * y_step;
+    y_hi = ceil (y_hi / y_step) * y_step;
+
+    /* --- Canvas / margins --- */
+    uint8_t *rgb = (uint8_t*)malloc(PLOT_W * PLOT_H * 3);
+    if (!rgb) return;
+    memset(rgb, 255, PLOT_W * PLOT_H * 3);
+
+    const int ML=72, MR=24, MT=36, MB=52;
+    int px0=ML, px1=PLOT_W-MR-1, py0=MT, py1=PLOT_H-MB-1;
+    int pw=px1-px0, ph=py1-py0;
+
+#define T_PY(val)  (py1 - (int)(((val)-y_lo)/(y_hi-y_lo)*ph + 0.5))
+#define T_PX(idx)  (px0 + (int)(((idx)+0.5)/(double)g_img_n*pw + 0.5))
+
+    /* --- Grid lines --- */
+    for (double yv=y_lo; yv<=y_hi+1e-9; yv+=y_step)
+        pline_h(rgb, px0+1, px1-1, T_PY(yv), 220, 220, 220);
+
+    /* --- Population mean dashed line (red) --- */
+    pdash_h(rgb, px0+1, px1-1, T_PY(pop_mean), 200, 40, 40);
+
+    /* --- ±0.5 SD dashed lines (blue) --- */
+    { double sd_vals[2] = {pop_mean - half_sd, pop_mean + half_sd};
+      for (int k = 0; k < 2; k++) {
+          int py = T_PY(sd_vals[k]);
+          if (py >= py0 && py <= py1)
+              pdash_h(rgb, px0+1, px1-1, py, 30, 100, 200);
+      } }
+
+    /* --- Sample mean line (2px thick) + 5x5 markers --- */
+    for (int i = 0; i < g_img_n-1; i++) {
+        int x0t=T_PX(i), y0t=T_PY(g_img_means[i]);
+        int x1t=T_PX(i+1), y1t=T_PY(g_img_means[i+1]);
+        pdraw_line(rgb, x0t, y0t,   x1t, y1t,   60, 60, 60);
+        pdraw_line(rgb, x0t, y0t+1, x1t, y1t+1, 60, 60, 60);
+    }
+    for (int i = 0; i < g_img_n; i++) {
+        int cx=T_PX(i), cy=T_PY(g_img_means[i]);
+        for (int dy=-2; dy<=2; dy++)
+            for (int dx=-2; dx<=2; dx++)
+                ppx(rgb, cx+dx, cy+dy, 60, 60, 60);
+    }
+
+    /* --- Border --- */
+    pline_h(rgb, px0, px1, py0, 80,80,80); pline_h(rgb, px0, px1, py1, 80,80,80);
+    pline_v(rgb, px0, py0, py1, 80,80,80); pline_v(rgb, px1, py0, py1, 80,80,80);
+
+    /* --- X-axis ticks --- */
+    int tick_every = g_img_n / 10 > 0 ? g_img_n / 10 : 1;
+    for (int i = 0; i < g_img_n; i++) {
+        if (i % tick_every != 0 && i != g_img_n-1) continue;
+        int tx = T_PX(i);
+        pline_v(rgb, tx, py1, py1+4, 80,80,80);
+        char lbl[16]; snprintf(lbl, sizeof(lbl), "%d", i+1);
+        pstr(rgb, tx - pstr_w(lbl)/2, py1+7, lbl, 60,60,60);
+    }
+
+    /* --- Y-axis ticks (regular grid, gray) --- */
+    for (double yv=y_lo; yv<=y_hi+1e-9; yv+=y_step) {
+        int py = T_PY(yv);
+        pline_h(rgb, px0-4, px0, py, 80,80,80);
+        char lbl[16]; snprintf(lbl, sizeof(lbl), "%.3f", yv);
+        pstr(rgb, px0-6-pstr_w(lbl), py-PFONT_H/2, lbl, 60,60,60);
+    }
+    /* Population mean tick — red, longer, drawn after grid so it overrides */
+    { int py = T_PY(pop_mean);
+      pline_h(rgb, px0-6, px0, py, 200,40,40);
+      char lbl[16]; snprintf(lbl, sizeof(lbl), "%.3f", pop_mean);
+      pstr(rgb, px0-8-pstr_w(lbl), py-PFONT_H/2, lbl, 200,40,40); }
+    /* ±0.5 SD ticks — blue */
+    { double sd_vals[2] = {pop_mean - half_sd, pop_mean + half_sd};
+      for (int k = 0; k < 2; k++) {
+          int py = T_PY(sd_vals[k]);
+          if (py < py0 || py > py1) continue;
+          pline_h(rgb, px0-6, px0, py, 30,100,200);
+          char lbl[16]; snprintf(lbl, sizeof(lbl), "%.3f", sd_vals[k]);
+          pstr(rgb, px0-8-pstr_w(lbl), py-PFONT_H/2, lbl, 30,100,200);
+      } }
+
+    /* --- Axis labels --- */
+    { const char *xl = "IMAGE (#)";
+      pstr(rgb, (px0+px1)/2 - pstr_w(xl)/2, PLOT_H-14, xl, 40,40,40); }
+    { const char *yl = "DIAMETER (MM)";
+      int yn=(int)strlen(yl), total_h=yn*(PFONT_H+2)-2;
+      int ys=(py0+py1)/2-total_h/2;
+      for (int i=0; i<yn; i++) { char ch[2]={yl[i],0}; pstr(rgb, 4, ys+i*(PFONT_H+2), ch, 40,40,40); } }
+
+    /* --- Legend --- */
+    { int ax=px1-2, ay=py0+4;
+      const char *s1="POPULATION MEAN";
+      pstr(rgb, ax-pstr_w(s1), ay, s1, 200,40,40); ay+=PFONT_H+4;
+      const char *s2="SAMPLE MEAN";
+      pstr(rgb, ax-pstr_w(s2), ay, s2, 60,60,60); ay+=PFONT_H+4;
+      const char *s3="+/- 0.5 STD DEV";
+      pstr(rgb, ax-pstr_w(s3), ay, s3, 30,100,200); }
+
+#undef T_PY
+#undef T_PX
+
+    /* --- Write PNG --- */
+    char path[MAX_PATH_LEN];
+    snprintf(path, MAX_PATH_LEN, "%s\\dot_trend.png", folder);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); return; }
+
+    { uint8_t ihdr[13];
+      ihdr[0]=(PLOT_W>>24)&0xFF; ihdr[1]=(PLOT_W>>16)&0xFF; ihdr[2]=(PLOT_W>>8)&0xFF; ihdr[3]=PLOT_W&0xFF;
+      ihdr[4]=(PLOT_H>>24)&0xFF; ihdr[5]=(PLOT_H>>16)&0xFF; ihdr[6]=(PLOT_H>>8)&0xFF; ihdr[7]=PLOT_H&0xFF;
+      ihdr[8]=8; ihdr[9]=2; ihdr[10]=0; ihdr[11]=0; ihdr[12]=0;
+      fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+      png_chunk(f, "IHDR", ihdr, 13); }
+
+    { int scan_w = 1 + PLOT_W*3;
+      size_t raw_len = (size_t)PLOT_H * scan_w;
+      uint8_t *raw = (uint8_t*)malloc(raw_len);
+      if (!raw) { fclose(f); free(rgb); return; }
+      for (int y=0; y<PLOT_H; y++) { raw[y*scan_w]=0; memcpy(raw+y*scan_w+1, rgb+y*PLOT_W*3, PLOT_W*3); }
+      uint32_t asum = adler32_calc(raw, raw_len);
+      size_t max_bsz=65535u, nblocks=(raw_len+max_bsz-1)/max_bsz;
+      size_t idat_cap=2+nblocks*5+raw_len+4;
+      uint8_t *idat=(uint8_t*)malloc(idat_cap);
+      if (!idat) { free(raw); fclose(f); free(rgb); return; }
+      size_t pos=0;
+      idat[pos++]=0x78; idat[pos++]=0x01;
+      size_t rem=raw_len, rpos=0;
+      while (rem>0) {
+          size_t blen=rem<max_bsz?rem:max_bsz;
+          idat[pos++]=(rem<=max_bsz)?0x01:0x00;
+          uint16_t l16=(uint16_t)blen, nl16=~l16;
+          idat[pos++]=l16&0xFF; idat[pos++]=(l16>>8)&0xFF;
+          idat[pos++]=nl16&0xFF; idat[pos++]=(nl16>>8)&0xFF;
+          memcpy(idat+pos, raw+rpos, blen); pos+=blen; rpos+=blen; rem-=blen;
+      }
+      idat[pos++]=(asum>>24)&0xFF; idat[pos++]=(asum>>16)&0xFF;
+      idat[pos++]=(asum>>8)&0xFF;  idat[pos++]=asum&0xFF;
+      png_chunk(f, "IDAT", idat, (uint32_t)pos);
+      free(idat); free(raw); }
+
+    png_chunk(f, "IEND", NULL, 0);
+    fclose(f);
+    free(rgb);
+}
+
+/* ================================================================
  *  SECTION 14 — BATCH PROCESSING (preserved, adapted for no Win32 controls)
  * ================================================================ */
 static void process_images(void) {
     if (!strlen(g_folder_a)) return;
     double px_mm = atof(g_pxmm_buf);
     if (px_mm <= 0) return;
-    int auto_th = g_auto_thresh, manual_th = g_threshold;
+    int thresh_mode = g_thresh_mode, manual_th = g_threshold;
+    int adapt_block = g_adapt_block, adapt_sens = g_adapt_sens;
+    int scratch_r = g_scratch_filter, min_dim = g_min_dimension;
     int min_area = g_min_area, erosion_r = g_erosion, mode = g_mode;
     int gridpat = g_grid_pattern;
     save_config();
@@ -2439,9 +3410,9 @@ static void process_images(void) {
     g_progress_max = nfiles; g_progress_val = 0; g_processing = 1;
 
     char of[MAX_PATH_LEN]; snprintf(of, MAX_PATH_LEN, "%s\\annotated", g_folder_a);
-    CreateDirectoryA(of, NULL);
+    if (g_out_annotated) CreateDirectoryA(of, NULL);
     char cp[MAX_PATH_LEN]; snprintf(cp, MAX_PATH_LEN, "%s\\dot_measurements.csv", g_folder_a);
-    FILE *csv = fopen(cp, "w");
+    FILE *csv = fopen(g_out_csv ? cp : "NUL", "w");
     if (!csv) { g_processing = 0; return; }
     fprintf(csv, "File,Dot_Index,Centroid_X,Centroid_Y,"
         "BBox_W_px,BBox_H_px,BBox_Diam_px,BBox_Diam_mm,"
@@ -2454,22 +3425,24 @@ static void process_images(void) {
     si(&gs_d, 50000); si(&gs_cr, 50000); si(&gs_cb, 50000);
     si(&gs_ox, 50000); si(&gs_oy, 50000); si(&gs_dist, 50000);
     int td = 0, tm = 0;
+    xdiam_reset();
+    img_means_reset();
 
     grid_params_t gp = {0};
     { int bfi = 0, bc = 0;
       for (int fi = 0; fi < nfiles && fi < 10; fi++) {
           pgm_image_t img;
           if (!pgm_load(files[fi], &img)) continue;
-          int th = auto_th ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
+          int th = (thresh_mode == THRESH_OTSU) ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
           static blob_t tb[MAX_BLOBS];
-          int nb = process_image_light(&img, th, min_area, tb, MAX_BLOBS);
+          int nb = process_image_light(&img, thresh_mode, th, adapt_block, adapt_sens, scratch_r, min_area, min_dim, tb, MAX_BLOBS);
           int gd = 0; for (int i = 0; i < nb; i++) if (!tb[i].merged) gd++;
           if (gd > bc) { bc = gd; bfi = fi; } pgm_free(&img); }
       pgm_image_t img;
       if (pgm_load(files[bfi], &img)) {
-          int th = auto_th ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
+          int th = (thresh_mode == THRESH_OTSU) ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
           static blob_t tb[MAX_BLOBS];
-          int nb = process_image_full(&img, th, min_area, erosion_r, tb, MAX_BLOBS);
+          int nb = process_image_full(&img, thresh_mode, th, adapt_block, adapt_sens, scratch_r, min_area, erosion_r, min_dim, tb, MAX_BLOBS);
           int iw = img.width, ih = img.height;
           if (gridpat == GRIDPAT_STAGGERED) infer_grid_params_checker(tb, nb, &gp, mode == MODE_BODY, iw, ih);
           else infer_grid_params(tb, nb, &gp, gridpat, mode == MODE_BODY, iw, ih);
@@ -2479,9 +3452,9 @@ static void process_images(void) {
     for (int fi = 0; fi < nfiles; fi++) {
         pgm_image_t img;
         if (!pgm_load(files[fi], &img)) { g_progress_val = fi + 1; continue; }
-        int thresh = auto_th ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
+        int thresh = (thresh_mode == THRESH_OTSU) ? compute_otsu(img.pixels, img.width * img.height) : manual_th;
         static blob_t blobs[MAX_BLOBS];
-        int nb = process_image_full(&img, thresh, min_area, erosion_r, blobs, MAX_BLOBS);
+        int nb = process_image_full(&img, thresh_mode, thresh, adapt_block, adapt_sens, scratch_r, min_area, erosion_r, min_dim, blobs, MAX_BLOBS);
         for (int i = 0; i < nb; i++) {
             blobs[i].diameter_mm = (double)blobs[i].diameter_px / px_mm;
             blobs[i].body_diameter_mm = blobs[i].body_major_px / px_mm;
@@ -2503,13 +3476,14 @@ static void process_images(void) {
                 b->grid_valid ? b->offset_x_mm : 0.0, b->grid_valid ? b->offset_y_mm : 0.0,
                 b->grid_valid ? dist_err : 0.0, b->merged ? "YES" : "NO");
             if (!b->merged) {
-                sa(&gs_d, pd); sa(&fs, pd);
+                sa(&gs_d, pd); sa(&fs, pd); xdiam_push(pd);
                 sa(&gs_cr, b->circularity_raw); sa(&gs_cb, b->circularity_body);
                 if (b->grid_valid) { sa(&gs_ox, fabs(b->offset_x_mm)); sa(&gs_oy, fabs(b->offset_y_mm)); sa(&gs_dist, dist_err); }
             }
             td++; if (b->merged) tm++;
         }
         if (fs.count > 0) {
+            img_means_push(smean(&fs));
             fprintf(csv, "%s,SUMMARY,,,,,,,,,,,,,,,,,\n", bn);
             fprintf(csv, "%s,Count,%d,,,,,,,,,,,,,,,\n", bn, fs.count);
             fprintf(csv, "%s,Missed,%d,,,,,,,,,,,,,,,\n", bn, file_missed);
@@ -2545,8 +3519,11 @@ static void process_images(void) {
                 dpx(&img, px, py, (tc2 == 255) ? 0 : 200);
             dstr(&img, tx, ty, label, tc2);
         }
-        char op[MAX_PATH_LEN]; snprintf(op, MAX_PATH_LEN, "%s\\%s", of, bn);
-        pgm_save(op, &img); pgm_free(&img);
+        if (g_out_annotated) {
+            char op[MAX_PATH_LEN]; snprintf(op, MAX_PATH_LEN, "%s\\%s", of, bn);
+            pgm_save(op, &img);
+        }
+        pgm_free(&img);
         g_progress_val = fi + 1;
         snprintf(g_status_text, sizeof(g_status_text), "Processed %d/%d: %s (%d dots)", fi + 1, nfiles, bn, nb);
         /* Pump messages to keep UI responsive */
@@ -2588,10 +3565,12 @@ static void process_images(void) {
             smean(&gs_dist), smed(&gs_dist), sstd(&gs_dist), gs_dist.min_val, gs_dist.max_val);
     }
     fclose(csv);
+    if (g_out_dist_plot)  write_dist_png(g_folder_a);
+    if (g_out_trend_plot) write_trend_png(g_folder_a);
 
     snprintf(g_status_text, sizeof(g_status_text),
-        "Done! %d files, %d dots (%d merged, %d missed). CSV: %s",
-        nfiles, td, tm, total_missed, cp);
+        "Done! %d files, %d dots (%d merged, %d missed). CSV + PNG: %s",
+        nfiles, td, tm, total_missed, g_folder_a);
     g_processing = 0;
     sfree(&gs_d); sfree(&gs_cr); sfree(&gs_cb); sfree(&gs_ox); sfree(&gs_oy); sfree(&gs_dist);
 }
@@ -2679,7 +3658,7 @@ static void setup_theme() {
     ImVec4 textDim = ImVec4(0.50f, 0.52f, 0.56f, 1.0f);
 
     c[ImGuiCol_WindowBg]        = bg;
-    c[ImGuiCol_ChildBg]         = panel;
+    c[ImGuiCol_ChildBg]         = bg;
     c[ImGuiCol_PopupBg]         = ImVec4(0.12f, 0.12f, 0.15f, 0.96f);
     c[ImGuiCol_Border]          = ImVec4(0.22f, 0.22f, 0.26f, 0.6f);
     c[ImGuiCol_FrameBg]         = widget;
@@ -2708,7 +3687,7 @@ static void setup_theme() {
     c[ImGuiCol_TextDisabled]    = textDim;
 
     s.WindowRounding    = 0.0f;
-    s.ChildRounding     = 4.0f;
+    s.ChildRounding     = 0.0f;
     s.FrameRounding     = 4.0f;
     s.GrabRounding      = 3.0f;
     s.PopupRounding     = 4.0f;
@@ -2732,6 +3711,36 @@ static void section_header(const char *label) {
     ImGui::Spacing();
 }
 
+/* CollapsingHeader: window-bg fill, thin rounded outline */
+static bool collapsing_header(const char *label, ImGuiTreeNodeFlags extra_flags = 0) {
+    const ImGuiStyle &s = ImGui::GetStyle();
+    ImVec4 bg  = s.Colors[ImGuiCol_WindowBg];
+    ImVec4 hov = ImVec4(bg.x + 0.05f, bg.y + 0.05f, bg.z + 0.06f, 1.0f);
+    ImVec4 act = ImVec4(bg.x + 0.02f, bg.y + 0.02f, bg.z + 0.03f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Header,        bg);
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, hov);
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  act);
+    bool open = ImGui::CollapsingHeader(label, extra_flags);
+    ImGui::PopStyleColor(3);
+    ImVec2 mn = ImGui::GetItemRectMin();
+    ImVec2 mx = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddRect(mn, mx,
+        ImGui::GetColorU32(s.Colors[ImGuiCol_FrameBg]), 4.0f, 0, 1.0f);
+    return open;
+}
+
+static void help_tip(const char *text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
 /* ================================================================
  *  SECTION 18 — ImGui UI DRAWING
  * ================================================================ */
@@ -2741,231 +3750,393 @@ static void draw_ui(void) {
     ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::Begin("##Main", NULL,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar);
+    ImGui::PopStyleVar();
 
     float total_w = ImGui::GetContentRegionAvail().x;
     float total_h = ImGui::GetContentRegionAvail().y;
 
     /* ---- LEFT PANEL ---- */
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * g_dpi_scale, 8.0f * g_dpi_scale));
     ImGui::BeginChild("##LeftPanel", ImVec2(g_left_panel_w, total_h), true);
+    ImGui::PopStyleVar();
     {
-        /* -- Image Folder -- */
-        section_header(L->sec_image_folder);
-        ImGui::Text("%s %s", L->path_label, strlen(g_folder_a) ? g_folder_a : L->none);
-        if (ImGui::Button(L->browse, ImVec2(-1, 0))) {
-            browse_folder_dialog(g_folder_a, g_folder_w, MAX_PATH_LEN,
-                L"Select folder containing PGM images");
-            scan_folder_for_preview();
-            prev_dirty = 1;
-        }
+        /* ===== ANALYZE group ===== */
+        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+        if (collapsing_header(L->sec_analyze)) {
+            float parent_x = ImGui::GetCursorScreenPos().x;
+            ImGui::Indent(20.0f * g_dpi_scale);
+            float child_x      = ImGui::GetCursorScreenPos().x;
+            float tree_x       = (parent_x + child_x) * 0.5f;
+            float tree_y_start = ImGui::GetCursorScreenPos().y;
 
-        /* -- Calibration -- */
-        section_header(L->sec_calibration);
-        ImGui::SetNextItemWidth(120 * g_dpi_scale);
-        ImGui::InputText(L->pixels_mm, g_pxmm_buf, sizeof(g_pxmm_buf));
-
-        const char *modes[] = { L->mode_bbox, L->mode_body };
-        ImGui::SetNextItemWidth(180 * g_dpi_scale);
-        int new_mode = g_mode;
-        ImGui::Combo(L->measurement, &new_mode, modes, 2);
-        if (new_mode != g_mode) { g_mode = new_mode; prev_dirty = 1; }
-
-        /* -- Threshold -- */
-        section_header(L->sec_threshold);
-        bool auto_th = (g_auto_thresh != 0);
-        if (ImGui::Checkbox(L->auto_thresh, &auto_th)) {
-            g_auto_thresh = auto_th ? 1 : 0; prev_dirty = 1;
-        }
-        if (!g_auto_thresh) {
-            ImGui::Text("%s", L->threshold_label);
-            ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
-            int new_th = g_threshold;
-            ImGui::SliderInt("##thresh", &new_th, 1, 254);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputInt("##thresh_in", &new_th, 0, 0);
-            if (new_th < 1) new_th = 1; if (new_th > 254) new_th = 254;
-            if (new_th != g_threshold) { g_threshold = new_th; prev_dirty = 1; }
-        } else {
-            ImGui::TextDisabled(L->auto_value, g_threshold);
-        }
-
-        /* -- Min Area -- */
-        ImGui::Text("%s", L->min_area_label);
-        ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
-        int new_ma = g_min_area;
-        ImGui::SliderInt("##minarea", &new_ma, 10, 2000);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##minarea_in", &new_ma, 0, 0);
-        if (new_ma < 10) new_ma = 10; if (new_ma > 2000) new_ma = 2000;
-        if (new_ma != g_min_area) { g_min_area = new_ma; prev_dirty = 1; }
-
-        /* -- Erosion (body mode only) -- */
-        if (g_mode == MODE_BODY) {
-            ImGui::Text("%s", L->erosion_label);
-            ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
-            int new_er = g_erosion;
-            ImGui::SliderInt("##erosion", &new_er, 1, 15);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputInt("##erosion_in", &new_er, 0, 0);
-            if (new_er < 1) new_er = 1; if (new_er > 15) new_er = 15;
-            if (new_er != g_erosion) { g_erosion = new_er; prev_dirty = 1; }
-        }
-
-        /* -- Overlays -- */
-        section_header(L->sec_overlays);
-        bool sc = (g_show_cross != 0), sg = (g_show_grid != 0);
-        if (ImGui::Checkbox(L->crosshairs, &sc)) { g_show_cross = sc ? 1 : 0; prev_dirty = 1; }
-        ImGui::SameLine(200 * g_dpi_scale);
-        if (ImGui::Checkbox(L->grid_lines, &sg)) { g_show_grid = sg ? 1 : 0; prev_dirty = 1; }
-
-        const char *pats[] = { L->pat_rect, L->pat_staggered };
-        ImGui::SetNextItemWidth(200 * g_dpi_scale);
-        int new_gp = g_grid_pattern;
-        ImGui::Combo(L->grid_pattern, &new_gp, pats, 2);
-        if (new_gp != g_grid_pattern) { g_grid_pattern = new_gp; prev_dirty = 1; }
-
-        /* Position evaluation thresholds */
-        ImGui::Text("%s", L->min_columns);
-        ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
-        int new_mpc = g_min_pos_columns;
-        ImGui::SliderInt("##mincols", &new_mpc, 2, 12);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##mincols_in", &new_mpc, 0, 0);
-        if (new_mpc < 2) new_mpc = 2; if (new_mpc > 12) new_mpc = 12;
-        if (new_mpc != g_min_pos_columns) { g_min_pos_columns = new_mpc; prev_dirty = 1; }
-        ImGui::Text("%s", L->min_dots_col);
-        ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
-        int new_mcd = g_min_col_dots;
-        ImGui::SliderInt("##mindots", &new_mcd, 2, 10);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputInt("##mindots_in", &new_mcd, 0, 0);
-        if (new_mcd < 2) new_mcd = 2; if (new_mcd > 10) new_mcd = 10;
-        if (new_mcd != g_min_col_dots) { g_min_col_dots = new_mcd; prev_dirty = 1; }
-
-        /* -- Process Button -- */
-        ImGui::Spacing(); ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.12f, 0.43f, 0.75f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.16f, 0.51f, 0.86f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.10f, 0.35f, 0.63f, 1.0f));
-        if (ImGui::Button(L->process_all, ImVec2(-1, 36 * g_dpi_scale)) && !g_processing) {
-            process_images();
-        }
-        ImGui::PopStyleColor(3);
-
-        /* -- Progress -- */
-        if (g_progress_max > 0) {
-            float prog = (float)g_progress_val / (float)g_progress_max;
-            char overlay[64];
-            snprintf(overlay, sizeof(overlay), "%d / %d", g_progress_val, g_progress_max);
-            ImGui::ProgressBar(prog, ImVec2(-1, 0), overlay);
-        }
-        ImGui::TextWrapped("%s", g_status_text);
-
-        /* ---- RECORD MODE ---- */
-        section_header(L->sec_record_mode);
-
-        /* Interface selector */
-        ImGui::SetNextItemWidth(-(60 * g_dpi_scale));
-        if (g_iface_count > 0) {
-            if (ImGui::BeginCombo("##iface", g_iface_descs[g_iface_sel])) {
-                for (int i = 0; i < g_iface_count; i++) {
-                    bool selected = (i == g_iface_sel);
-                    if (ImGui::Selectable(g_iface_descs[i], selected))
-                        g_iface_sel = i;
-                    if (selected) ImGui::SetItemDefaultFocus();
+            /* -- Image Folder -- */
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (collapsing_header(L->sec_image_folder)) {
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s %s", L->path_label, strlen(g_folder_a) ? g_folder_a : L->none);
+                if (ImGui::Button(L->browse, ImVec2(-1, 0))) {
+                    browse_folder_dialog(g_folder_a, g_folder_w, MAX_PATH_LEN,
+                        L"Select folder containing PGM images");
+                    scan_folder_for_preview();
+                    prev_dirty = 1;
                 }
-                ImGui::EndCombo();
+                ImGui::Spacing();
             }
-        } else {
-            ImGui::TextDisabled("%s", L->no_interfaces);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button(L->scan)) {
-            refresh_interfaces();
-        }
 
-        /* Output folder */
-        ImGui::Text("%s %s", L->output_label, strlen(g_outfolder_a) ? g_outfolder_a : L->none);
-        char browse_out_id[64]; snprintf(browse_out_id, sizeof(browse_out_id), "%s##out", L->browse);
-        if (ImGui::Button(browse_out_id, ImVec2(-1, 0))) {
-            browse_folder_dialog(g_outfolder_a, g_outfolder_w, MAX_PATH_LEN,
-                L"Select output folder for recorded frames");
-        }
-
-        /* Stability / MAD */
-        ImGui::SetNextItemWidth(80 * g_dpi_scale);
-        ImGui::InputText(L->stable_s, g_stable_sec_buf, sizeof(g_stable_sec_buf));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80 * g_dpi_scale);
-        ImGui::InputText(L->mad, g_mad_thresh_buf, sizeof(g_mad_thresh_buf));
-
-        /* Image orientation */
-        ImGui::Spacing();
-        ImGui::Text("Orientation:");
-        { bool fx = (g_rec_flip_x!=0), fy = (g_rec_flip_y!=0), r90 = (g_rec_rotate_90!=0);
-          if (ImGui::Checkbox("Flip X", &fx)) g_rec_flip_x = fx?1:0;
-          ImGui::SameLine();
-          if (ImGui::Checkbox("Flip Y", &fy)) g_rec_flip_y = fy?1:0;
-          ImGui::SameLine();
-          if (ImGui::Checkbox("Rotate 90", &r90)) g_rec_rotate_90 = r90?1:0;
-        }
-
-        /* Live stream preview button */
-        if (g_rec_state == REC_IDLE) {
-            if (!g_live_running) {
-                if (ImGui::Button("Live Preview", ImVec2(-1, 0)))
-                    start_live_preview();
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.86f, 1.0f));
-                if (ImGui::Button("Stop Preview", ImVec2(-1, 0)))
-                    stop_live_preview();
-                ImGui::PopStyleColor();
+            /* -- Outputs -- */
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (collapsing_header(L->sec_outputs)) {
+                ImGui::Spacing();
+                ImGui::Checkbox(L->out_annotated,  (bool*)&g_out_annotated);
+                ImGui::Checkbox(L->out_csv,        (bool*)&g_out_csv);
+                ImGui::Checkbox(L->out_dist_plot,  (bool*)&g_out_dist_plot);
+                ImGui::Checkbox(L->out_trend_plot, (bool*)&g_out_trend_plot);
+                ImGui::Spacing();
             }
-        }
 
-        /* Stitch mode */
-        ImGui::Spacing();
-        { bool sm = (g_stitch_mode!=0);
-          if (ImGui::Checkbox("Stitch mode", &sm)) g_stitch_mode = sm?1:0;
-        }
-        if (g_stitch_mode) {
-            ImGui::SetNextItemWidth(60 * g_dpi_scale);
-            ImGui::InputText("Overlap %", g_stitch_overlap_buf, sizeof(g_stitch_overlap_buf));
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(60 * g_dpi_scale);
-            ImGui::InputText("Scale %", g_stitch_scale_buf, sizeof(g_stitch_scale_buf));
-            ImGui::TextDisabled("Grid auto-detected from capture timing");
-        }
+            /* -- Calibration -- */
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (collapsing_header(L->sec_calibration)) {
+                ImGui::Spacing();
+                ImGui::SetNextItemWidth(120 * g_dpi_scale);
+                ImGui::InputText(L->pixels_mm, g_pxmm_buf, sizeof(g_pxmm_buf));
+                help_tip(L->tip_pixels_mm);
+                const char *modes[] = { L->mode_bbox, L->mode_body };
+                ImGui::SetNextItemWidth(180 * g_dpi_scale);
+                int new_mode = g_mode;
+                ImGui::Combo(L->measurement, &new_mode, modes, 2);
+                help_tip(L->tip_measurement);
+                if (new_mode != g_mode) { g_mode = new_mode; prev_dirty = 1; }
+                ImGui::Spacing();
+            }
 
-        /* Record button */
-        ImGui::Spacing();
-        if (g_rec_state == REC_IDLE) {
-            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.63f, 0.16f, 0.16f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.78f, 0.20f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.51f, 0.12f, 0.12f, 1.0f));
-            if (ImGui::Button(L->start_rec, ImVec2(-1, 32 * g_dpi_scale)))
-                start_recording();
+            /* -- Threshold -- */
+            ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+            if (collapsing_header(L->sec_threshold)) {
+                ImGui::Spacing();
+                const char *thresh_modes[] = { L->thresh_manual, L->thresh_otsu, L->thresh_adaptive };
+                ImGui::Text("%s", L->thresh_mode_label);
+                help_tip(L->tip_thresh_mode);
+                ImGui::SetNextItemWidth(180 * g_dpi_scale);
+                int new_tm = g_thresh_mode;
+                ImGui::Combo("##threshmode", &new_tm, thresh_modes, 3);
+                if (new_tm != g_thresh_mode) { g_thresh_mode = new_tm; prev_dirty = 1; }
+
+                if (g_thresh_mode == THRESH_MANUAL) {
+                    ImGui::Text("%s", L->threshold_label);
+                    help_tip(L->tip_thresh_manual);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    int new_th = g_threshold;
+                    ImGui::SliderInt("##thresh", &new_th, 1, 254);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputInt("##thresh_in", &new_th, 0, 0);
+                    if (new_th < 1) new_th = 1; if (new_th > 254) new_th = 254;
+                    if (new_th != g_threshold) { g_threshold = new_th; prev_dirty = 1; }
+                } else if (g_thresh_mode == THRESH_OTSU) {
+                    ImGui::TextDisabled(L->auto_value, g_threshold);
+                } else {
+                    ImGui::Text("%s", L->adapt_block_label);
+                    help_tip(L->tip_adapt_block);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    int new_ab = g_adapt_block;
+                    ImGui::SliderInt("##adaptblock", &new_ab, 10, 300);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputInt("##adaptblock_in", &new_ab, 0, 0);
+                    if (new_ab < 10) new_ab = 10; if (new_ab > 300) new_ab = 300;
+                    if (new_ab != g_adapt_block) { g_adapt_block = new_ab; prev_dirty = 1; }
+                    ImGui::Text("%s", L->adapt_sens_label);
+                    help_tip(L->tip_adapt_sens);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    int new_as = g_adapt_sens;
+                    ImGui::SliderInt("##adaptsens", &new_as, 1, 50);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputInt("##adaptsens_in", &new_as, 0, 0);
+                    if (new_as < 1) new_as = 1; if (new_as > 50) new_as = 50;
+                    if (new_as != g_adapt_sens) { g_adapt_sens = new_as; prev_dirty = 1; }
+                }
+                ImGui::Text("%s", L->min_area_label);
+                help_tip(L->tip_min_area);
+                ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                int new_ma = g_min_area;
+                ImGui::SliderInt("##minarea", &new_ma, 10, 2000);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##minarea_in", &new_ma, 0, 0);
+                if (new_ma < 10) new_ma = 10; if (new_ma > 2000) new_ma = 2000;
+                if (new_ma != g_min_area) { g_min_area = new_ma; prev_dirty = 1; }
+                ImGui::Text("%s", L->min_dim_label);
+                help_tip(L->tip_min_dim);
+                ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                int new_md = g_min_dimension;
+                ImGui::SliderInt("##mindim", &new_md, 0, 100);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##mindim_in", &new_md, 0, 0);
+                if (new_md < 0) new_md = 0; if (new_md > 100) new_md = 100;
+                if (new_md != g_min_dimension) { g_min_dimension = new_md; prev_dirty = 1; }
+                if (g_mode == MODE_BODY) {
+                    ImGui::Text("%s", L->erosion_label);
+                    help_tip(L->tip_erosion);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    int new_er = g_erosion;
+                    ImGui::SliderInt("##erosion", &new_er, 1, 15);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputInt("##erosion_in", &new_er, 0, 0);
+                    if (new_er < 1) new_er = 1; if (new_er > 15) new_er = 15;
+                    if (new_er != g_erosion) { g_erosion = new_er; prev_dirty = 1; }
+                }
+                ImGui::Text("%s", L->scratch_filter_label);
+                help_tip(L->tip_scratch_filter);
+                ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                int new_sf = g_scratch_filter;
+                ImGui::SliderInt("##scratchfilt", &new_sf, 0, 10);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##scratchfilt_in", &new_sf, 0, 0);
+                if (new_sf < 0) new_sf = 0; if (new_sf > 10) new_sf = 10;
+                if (new_sf != g_scratch_filter) { g_scratch_filter = new_sf; prev_dirty = 1; }
+                ImGui::Spacing();
+            }
+
+            /* -- Shape Filters -- */
+            ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+            if (collapsing_header(L->sec_shape_filters)) {
+                ImGui::Spacing();
+
+                bool fc = (g_filter_circ != 0);
+                if (ImGui::Checkbox(L->filter_circ_enable, &fc)) { g_filter_circ = fc ? 1 : 0; prev_dirty = 1; }
+                help_tip(L->tip_circ_enable);
+                if (g_filter_circ) {
+                    ImGui::Text("%s", L->filter_circ_label);
+                    help_tip(L->tip_min_circ);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    float circ_val = (float)g_min_circ;
+                    ImGui::SliderFloat("##mincirc", &circ_val, 0.05f, 0.95f, "%.2f");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputFloat("##mincirc_in", &circ_val, 0, 0, "%.2f");
+                    if (circ_val < 0.05f) circ_val = 0.05f; if (circ_val > 0.95f) circ_val = 0.95f;
+                    if ((double)circ_val != g_min_circ) { g_min_circ = (double)circ_val; prev_dirty = 1; }
+                }
+
+                bool fs = (g_filter_solidity != 0);
+                if (ImGui::Checkbox(L->filter_solidity_enable, &fs)) { g_filter_solidity = fs ? 1 : 0; prev_dirty = 1; }
+                help_tip(L->tip_solid_enable);
+                if (g_filter_solidity) {
+                    ImGui::Text("%s", L->filter_solidity_label);
+                    help_tip(L->tip_min_solid);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    float sol_val = (float)g_min_solidity;
+                    ImGui::SliderFloat("##minsol", &sol_val, 0.10f, 0.95f, "%.2f");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputFloat("##minsol_in", &sol_val, 0, 0, "%.2f");
+                    if (sol_val < 0.10f) sol_val = 0.10f; if (sol_val > 0.95f) sol_val = 0.95f;
+                    if ((double)sol_val != g_min_solidity) { g_min_solidity = (double)sol_val; prev_dirty = 1; }
+                }
+
+                bool fa = (g_filter_aspect != 0);
+                if (ImGui::Checkbox(L->filter_aspect_enable, &fa)) { g_filter_aspect = fa ? 1 : 0; prev_dirty = 1; }
+                help_tip(L->tip_aspect_enable);
+                if (g_filter_aspect) {
+                    ImGui::Text("%s", L->filter_aspect_label);
+                    help_tip(L->tip_max_aspect);
+                    ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                    float asp_val = (float)g_max_aspect;
+                    ImGui::SliderFloat("##maxasp", &asp_val, 1.1f, 5.0f, "%.1f");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputFloat("##maxasp_in", &asp_val, 0, 0, "%.1f");
+                    if (asp_val < 1.1f) asp_val = 1.1f; if (asp_val > 5.0f) asp_val = 5.0f;
+                    if ((double)asp_val != g_max_aspect) { g_max_aspect = (double)asp_val; prev_dirty = 1; }
+                }
+
+                ImGui::Spacing();
+            }
+
+            /* -- Overlays -- */
+            ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+            if (collapsing_header(L->sec_overlays)) {
+                ImGui::Spacing();
+                bool sc = (g_show_cross != 0), sg = (g_show_grid != 0);
+                if (ImGui::Checkbox(L->crosshairs, &sc)) { g_show_cross = sc ? 1 : 0; prev_dirty = 1; }
+                help_tip(L->tip_crosshairs);
+                ImGui::SameLine(200 * g_dpi_scale);
+                if (ImGui::Checkbox(L->grid_lines, &sg)) { g_show_grid = sg ? 1 : 0; prev_dirty = 1; }
+                help_tip(L->tip_grid_lines);
+                const char *pats[] = { L->pat_rect, L->pat_staggered };
+                ImGui::SetNextItemWidth(200 * g_dpi_scale);
+                int new_gp = g_grid_pattern;
+                ImGui::Combo(L->grid_pattern, &new_gp, pats, 2);
+                help_tip(L->tip_grid_pattern);
+                if (new_gp != g_grid_pattern) { g_grid_pattern = new_gp; prev_dirty = 1; }
+                ImGui::Text("%s", L->min_columns);
+                help_tip(L->tip_min_columns);
+                ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                int new_mpc = g_min_pos_columns;
+                ImGui::SliderInt("##mincols", &new_mpc, 2, 12);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##mincols_in", &new_mpc, 0, 0);
+                if (new_mpc < 2) new_mpc = 2; if (new_mpc > 12) new_mpc = 12;
+                if (new_mpc != g_min_pos_columns) { g_min_pos_columns = new_mpc; prev_dirty = 1; }
+                ImGui::Text("%s", L->min_dots_col);
+                help_tip(L->tip_min_dots_col);
+                ImGui::SetNextItemWidth(-(80 * g_dpi_scale));
+                int new_mcd = g_min_col_dots;
+                ImGui::SliderInt("##mindots", &new_mcd, 2, 10);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1);
+                ImGui::InputInt("##mindots_in", &new_mcd, 0, 0);
+                if (new_mcd < 2) new_mcd = 2; if (new_mcd > 10) new_mcd = 10;
+                if (new_mcd != g_min_col_dots) { g_min_col_dots = new_mcd; prev_dirty = 1; }
+                ImGui::Spacing();
+            }
+
+            { /* tree guide line */
+                float tree_y_end = ImGui::GetCursorScreenPos().y;
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(tree_x, tree_y_start), ImVec2(tree_x, tree_y_end),
+                    ImGui::GetColorU32(ImVec4(0.30f, 0.30f, 0.36f, 0.70f)), 1.0f);
+            }
+            ImGui::Unindent(20.0f * g_dpi_scale);
+
+            /* -- Process Button & Status -- */
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.12f, 0.43f, 0.75f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.16f, 0.51f, 0.86f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.10f, 0.35f, 0.63f, 1.0f));
+            if (ImGui::Button(L->process_all, ImVec2(-1, 36 * g_dpi_scale)) && !g_processing) {
+                process_images();
+            }
             ImGui::PopStyleColor(3);
-        } else {
-            if (ImGui::Button(L->stop_rec, ImVec2(-1, 32 * g_dpi_scale)))
-                stop_recording();
+            if (g_progress_max > 0) {
+                float prog = (float)g_progress_val / (float)g_progress_max;
+                char overlay[64];
+                snprintf(overlay, sizeof(overlay), "%d / %d", g_progress_val, g_progress_max);
+                ImGui::ProgressBar(prog, ImVec2(-1, 0), overlay);
+            }
+            ImGui::TextWrapped("%s", g_status_text);
         }
-        ImGui::TextWrapped("%s", g_rec_status);
+
+        /* ===== RECORD MODE group ===== */
+        ImGui::Spacing();
+        ImGui::SetNextItemOpen(false, ImGuiCond_Once);
+        if (collapsing_header(L->sec_record_mode)) {
+            ImGui::Spacing();
+
+            /* Interface selector */
+            ImGui::SetNextItemWidth(-(60 * g_dpi_scale));
+            if (g_iface_count > 0) {
+                if (ImGui::BeginCombo("##iface", g_iface_descs[g_iface_sel])) {
+                    for (int i = 0; i < g_iface_count; i++) {
+                        bool selected = (i == g_iface_sel);
+                        if (ImGui::Selectable(g_iface_descs[i], selected))
+                            g_iface_sel = i;
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            } else {
+                ImGui::TextDisabled("%s", L->no_interfaces);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(L->scan)) {
+                refresh_interfaces();
+            }
+
+            /* Output folder */
+            ImGui::Text("%s %s", L->output_label, strlen(g_outfolder_a) ? g_outfolder_a : L->none);
+            char browse_out_id[64]; snprintf(browse_out_id, sizeof(browse_out_id), "%s##out", L->browse);
+            if (ImGui::Button(browse_out_id, ImVec2(-1, 0))) {
+                browse_folder_dialog(g_outfolder_a, g_outfolder_w, MAX_PATH_LEN,
+                    L"Select output folder for recorded frames");
+            }
+
+            /* Stability / MAD */
+            ImGui::SetNextItemWidth(80 * g_dpi_scale);
+            ImGui::InputText(L->stable_s, g_stable_sec_buf, sizeof(g_stable_sec_buf));
+            help_tip(L->tip_stable_s);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80 * g_dpi_scale);
+            ImGui::InputText(L->mad, g_mad_thresh_buf, sizeof(g_mad_thresh_buf));
+            help_tip(L->tip_mad);
+
+            /* Image orientation */
+            ImGui::Spacing();
+            ImGui::Text("%s", L->orientation);
+            help_tip(L->tip_orientation);
+            { bool fx = (g_rec_flip_x!=0), fy = (g_rec_flip_y!=0), r90 = (g_rec_rotate_90!=0);
+              if (ImGui::Checkbox(L->flip_x, &fx)) g_rec_flip_x = fx?1:0;
+              ImGui::SameLine();
+              if (ImGui::Checkbox(L->flip_y, &fy)) g_rec_flip_y = fy?1:0;
+              ImGui::SameLine();
+              if (ImGui::Checkbox(L->rotate_90, &r90)) g_rec_rotate_90 = r90?1:0;
+            }
+
+            /* Live stream preview button */
+            if (g_rec_state == REC_IDLE) {
+                if (!g_live_running) {
+                    if (ImGui::Button(L->live_preview, ImVec2(-1, 0)))
+                        start_live_preview();
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.86f, 1.0f));
+                    if (ImGui::Button(L->stop_preview, ImVec2(-1, 0)))
+                        stop_live_preview();
+                    ImGui::PopStyleColor();
+                }
+            }
+
+            /* Stitch mode */
+            ImGui::Spacing();
+            { bool sm = (g_stitch_mode!=0);
+              if (ImGui::Checkbox(L->stitch_mode, &sm)) g_stitch_mode = sm?1:0;
+            }
+            help_tip(L->tip_stitch_mode);
+            if (g_stitch_mode) {
+                ImGui::SetNextItemWidth(60 * g_dpi_scale);
+                ImGui::InputText(L->overlap_pct, g_stitch_overlap_buf, sizeof(g_stitch_overlap_buf));
+                help_tip(L->tip_overlap_pct);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(60 * g_dpi_scale);
+                ImGui::InputText(L->scale_pct, g_stitch_scale_buf, sizeof(g_stitch_scale_buf));
+                help_tip(L->tip_scale_pct);
+                ImGui::TextDisabled("%s", L->grid_auto_hint);
+            }
+
+            /* Record button */
+            ImGui::Spacing();
+            if (g_rec_state == REC_IDLE) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.63f, 0.16f, 0.16f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.78f, 0.20f, 0.20f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.51f, 0.12f, 0.12f, 1.0f));
+                if (ImGui::Button(L->start_rec, ImVec2(-1, 32 * g_dpi_scale)))
+                    start_recording();
+                ImGui::PopStyleColor(3);
+            } else {
+                if (ImGui::Button(L->stop_rec, ImVec2(-1, 32 * g_dpi_scale)))
+                    stop_recording();
+            }
+            ImGui::TextWrapped("%s", g_rec_status);
+        }
     }
     ImGui::EndChild();
 
-    ImGui::SameLine();
+    ImGui::SameLine(0, 0);
 
     /* ---- RIGHT PANEL (Preview) ---- */
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * g_dpi_scale, 8.0f * g_dpi_scale));
     ImGui::BeginChild("##RightPanel", ImVec2(0, total_h), true);
+    ImGui::PopStyleVar();
     {
         /* Nav bar */
         if (ImGui::ArrowButton("##prev", ImGuiDir_Left)) {
@@ -3009,14 +4180,14 @@ static void draw_ui(void) {
         if (g_stream_preview_active) {
             if (g_showing_stitch_result) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.8f, 1.0f, 1.0f));
-                ImGui::Text("STITCHED RESULT");
+                ImGui::Text("%s", L->stitched_result);
                 ImGui::PopStyleColor();
             } else {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 1.0f, 0.3f, 1.0f));
-                ImGui::Text("LIVE FEED");
+                ImGui::Text("%s", L->live_feed);
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
-                ImGui::TextDisabled("MAD: %.1f", g_mad_current);
+                ImGui::TextDisabled(L->mad_fmt, g_mad_current);
             }
             ImGui::SameLine(ImGui::GetContentRegionMax().x - 25 * g_dpi_scale);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
@@ -3311,7 +4482,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
     RegisterClassW(&wc);
 
-    g_hwnd = CreateWindowW(L"DotAnalyzerImGui", L"Dot Analyzer  v8.0",
+    g_hwnd = CreateWindowW(L"DotAnalyzerImGui", L"Dot Analyzer  v8.2.1",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
         MIN_WIN_W, MIN_WIN_H, NULL, NULL, hInst, NULL);
 
