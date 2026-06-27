@@ -12,3 +12,6 @@ dot_analyzer.cfg
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Claude Code local settings (machine-specific)
+.claude/

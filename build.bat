@@ -1,5 +1,5 @@
 @echo off
-echo === Building Dot Analyzer v8.2.8 (ImGui + OpenGL3) ===
+echo === Building Dot Analyzer v8.2.15 (ImGui + OpenGL3) ===
 echo.
 
 REM --- Check for ImGui files ---
@@ -22,18 +22,17 @@ echo [1/3] Compiling resource file...
 if exist dot_analyzer.rc (
     windres dot_analyzer.rc -o dot_analyzer_res.o
     if errorlevel 1 (
-        echo WARNING: Resource compilation failed, building without icon.
-        set "RES_OBJ="
-    ) else (
-        set "RES_OBJ=dot_analyzer_res.o"
+        echo ERROR: Resource compilation failed. Icon is required -- aborting.
+        exit /b 1
     )
+    set "RES_OBJ=dot_analyzer_res.o"
 ) else (
-    echo       No .rc file found, building without icon.
-    set "RES_OBJ="
+    echo ERROR: dot_analyzer.rc not found. Icon is required -- aborting.
+    exit /b 1
 )
 
 echo [2/3] Compiling source code...
-g++ dot_analyzer_v8.2.8.cpp %RES_OBJ% ^
+g++ dot_analyzer_v8.2.15.cpp %RES_OBJ% ^
     imgui\imgui.cpp ^
     imgui\imgui_draw.cpp ^
     imgui\imgui_tables.cpp ^
